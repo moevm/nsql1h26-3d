@@ -75,6 +75,7 @@ async def get_logs(
 
     cursor = db.logs.find().skip(start).limit(limit)
     logs_list = await cursor.to_list(length=limit)
+    total = await db.logs.count_documents({})
 
     for log in logs_list:
         log['_id'] = str(log['_id'])
@@ -83,7 +84,8 @@ async def get_logs(
         'pagination': {
             'start': start,
             'limit': limit,
-            'count_returned': len(logs_list)
+            'count_returned': len(logs_list),
+            'total': total
         },
         'data': logs_list
     }
