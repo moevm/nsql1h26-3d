@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  db:
+    image: mongo:8.2.5
+    container_name: mongodb
+    restart: always
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  backend:
+    build:
+      context: ./hello_world/backend
+    container_name: backend_app
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - MONGO_URL=mongodb://db:27017
+    depends_on:
+      - db
+
+  frontend:
+    build:
+      context: ./hello_world/frontend
+      args:
+        - VITE_API_URL=http://backend:8000
+    container_name: frontend_app
+    restart: always
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://backend:8000
+    depends_on:
+      - backend
+
+volumes:
+  mongo_data:
