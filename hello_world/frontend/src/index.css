@@ -1,0 +1,69 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 222 20% 8%;
+    --foreground: 210 40% 96%;
+    --card: 222 20% 11%;
+    --card-foreground: 210 40% 96%;
+    --popover: 222 20% 11%;
+    --popover-foreground: 210 40% 96%;
+    --primary: 185 100% 50%;
+    --primary-foreground: 222 20% 8%;
+    --secondary: 222 15% 16%;
+    --secondary-foreground: 210 40% 96%;
+    --muted: 222 15% 16%;
+    --muted-foreground: 215 20% 55%;
+    --accent: 150 80% 45%;
+    --accent-foreground: 222 20% 8%;
+    --destructive: 0 70% 55%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 222 15% 18%;
+    --input: 222 15% 18%;
+    --ring: 185 100% 50%;
+    --chart-1: 185 100% 50%;
+    --chart-2: 150 80% 45%;
+    --chart-3: 280 70% 65%;
+    --chart-4: 45 100% 55%;
+    --chart-5: 0 70% 55%;
+    --radius: 0.6rem;
+
+    /* custom tokens */
+    --cyan: 185 100% 50%;
+    --lime: 150 80% 45%;
+    --panel-bg: 222 20% 11%;
+    --panel-border: 222 15% 18%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  body {
+    @apply bg-background text-foreground font-inter;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+}
+
+/* Glow effects */
+.glow-cyan {
+  box-shadow: 0 0 12px rgba(0, 229, 255, 0.25), 0 0 24px rgba(0, 229, 255, 0.08);
+}
+.glow-lime {
+  box-shadow: 0 0 12px rgba(57, 221, 120, 0.25), 0 0 24px rgba(57, 221, 120, 0.08);
+}
+.glow-cyan-text {
+  text-shadow: 0 0 8px rgba(0, 229, 255, 0.6);
+}
+
+/* Subtle scrollbar */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: hsl(222 15% 25%); border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: hsl(185 100% 50% / 0.4); }

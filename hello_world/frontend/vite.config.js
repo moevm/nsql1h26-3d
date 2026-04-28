@@ -1,25 +1,25 @@
-import { defineConfig, loadEnv } from 'vite'
-import react from '@vitejs/plugin-react'
+import react from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
+import path from "path";
 
-export default defineConfig(({ mode }) => {
-  // Загружаем переменные из .env на основе текущего режима (development/production)
-  const env = loadEnv(mode, process.cwd(), '');
-
-  return {
-    plugins: [react()],
-    server: {
-      proxy: {
-        '/hello': {
-          target: env.VITE_API_URL, // Берем адрес из .env
-          changeOrigin: true,
-          secure: false,
-        },
-        '/logs': {
-          target: env.VITE_API_URL, // И тут тоже
-          changeOrigin: true,
-          secure: false,
-        },
-      }
-    }
-  }
-})
+export default defineConfig({
+  plugins: [react()],
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "./src"),
+    },
+  },
+  server: {
+    host: "0.0.0.0",
+    port: 5173,
+    proxy: {
+      "/auth": { target: "http://backend:8000", changeOrigin: true },
+      "/entities": { target: "http://backend:8000", changeOrigin: true },
+      "/users": { target: "http://backend:8000", changeOrigin: true },
+      "/benchmarks": { target: "http://backend:8000", changeOrigin: true },
+      "/files": { target: "http://backend:8000", changeOrigin: true },
+      "/backup": { target: "http://backend:8000", changeOrigin: true },
+      "/health": { target: "http://backend:8000", changeOrigin: true },
+    },
+  },
+});

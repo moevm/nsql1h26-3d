@@ -1,0 +1,59 @@
+{
+  "name": "BenchmarkResult",
+  "type": "object",
+  "properties": {
+    "dataset_id": {
+      "type": "string",
+      "description": "Reference to Dataset"
+    },
+    "dataset_name": {
+      "type": "string",
+      "description": "Dataset name (denormalized)"
+    },
+    "algorithm": {
+      "type": "string",
+      "enum": [
+        "kdtree",
+        "octree",
+        "bvh",
+        "lsh"
+      ],
+      "description": "Algorithm used"
+    },
+    "build_time_ms": {
+      "type": "number",
+      "description": "Build time in ms"
+    },
+    "memory_mb": {
+      "type": "number",
+      "description": "Memory usage in MB"
+    },
+    "accuracy_pct": {
+      "type": "number",
+      "description": "Accuracy percentage"
+    },
+    "point_count": {
+      "type": "number",
+      "description": "Number of points benchmarked"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "processing",
+        "completed",
+        "failed"
+      ],
+      "default": "queued"
+    },
+    "metrics_series": {
+      "type": "string",
+      "description": "JSON string of time-series data"
+    }
+  },
+  "required": [
+    "dataset_id",
+    "algorithm",
+    "status"
+  ]
+}
