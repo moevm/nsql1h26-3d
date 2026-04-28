@@ -1,0 +1,54 @@
+{
+  "name": "Dataset",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Dataset name"
+    },
+    "description": {
+      "type": "string",
+      "description": "Dataset description"
+    },
+    "source": {
+      "type": "string",
+      "enum": [
+        "generated_sphere",
+        "generated_torus",
+        "generated_random",
+        "generated_plane",
+        "uploaded"
+      ],
+      "description": "How the dataset was created"
+    },
+    "point_count": {
+      "type": "number",
+      "description": "Number of points"
+    },
+    "file_url": {
+      "type": "string",
+      "description": "URL to uploaded file (if uploaded)"
+    },
+    "file_name": {
+      "type": "string",
+      "description": "Original file name"
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Tags"
+    },
+    "is_public": {
+      "type": "boolean",
+      "default": false,
+      "description": "Visible to all users"
+    }
+  },
+  "required": [
+    "name",
+    "source",
+    "point_count"
+  ]
+}
