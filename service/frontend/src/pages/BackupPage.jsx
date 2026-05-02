@@ -1,11 +1,13 @@
 import React, { useState } from "react";
 import { Download, Upload, Shield, Loader2, Check, AlertTriangle } from "lucide-react";
+import { pointCloud } from "@/api/pointCloudClient";
 
 export default function BackupPage({ user }) {
   const [exporting, setExporting] = useState(false);
   const [importing, setImporting] = useState(false);
   const [importDone, setImportDone] = useState(false);
   const [importError, setImportError] = useState(null);
+  const [exportError, setExportError] = useState(null);
   const [exportedData, setExportedData] = useState(null);
 
   if (user?.role !== "admin") {
@@ -21,35 +23,33 @@ export default function BackupPage({ user }) {
 
   const handleExport = async () => {
     setExporting(true);
-    const token = localStorage.getItem("nsql_api_token");
-    const response = await fetch("/backup/export", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      },
-    });
-    const backup = await response.json();
-    const datasets = backup.entities?.datasets ?? [];
-    const benchmarks = backup.entities?.benchmarks ?? [];
-    const users = backup.entities?.users ?? [];
-    const statusEvents = backup.entities?.benchmark_status_events ?? [];
+    setExportError(null);
+    try {
+      const backup = await pointCloud.backup.export();
+      const datasets = backup.entities?.datasets ?? [];
+      const benchmarks = backup.entities?.benchmarks ?? [];
+      const users = backup.entities?.users ?? [];
+      const statusEvents = backup.entities?.benchmark_status_events ?? [];
 
-    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `pointcloud_backup_${new Date().toISOString().split("T")[0]}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+      const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `pointcloud_backup_${new Date().toISOString().split("T")[0]}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
 
-    setExportedData({
-      datasets: datasets.length,
-      benchmarks: benchmarks.length,
-      users: users.length,
-      ...(statusEvents.length > 0 && { statusEvents: statusEvents.length }),
-    });
-    setExporting(false);
+      setExportedData({
+        datasets: datasets.length,
+        benchmarks: benchmarks.length,
+        users: users.length,
+        ...(statusEvents.length > 0 && { statusEvents: statusEvents.length }),
+      });
+    } catch (e) {
+      setExportError(e.message || "Export failed");
+    } finally {
+      setExporting(false);
+    }
   };
 
   const handleImport = async (e) => {
@@ -58,29 +58,24 @@ export default function BackupPage({ user }) {
     setImporting(true);
     setImportError(null);
 
-    const text = await file.text();
-    const backup = JSON.parse(text);
+    try {
+      const text = await file.text();
+      const backup = JSON.parse(text);
 
-    if (!backup.entities) {
-      setImportError("Invalid backup file format");
+      if (!backup.entities) {
+        setImportError("Invalid backup file format");
+        return;
+      }
+
+      await pointCloud.backup.importReplace(backup);
+      setImportDone(true);
+      setTimeout(() => setImportDone(false), 3000);
+    } catch (err) {
+      setImportError(err.message || "Import failed");
+    } finally {
       setImporting(false);
-      return;
+      e.target.value = "";
     }
-
-    const token = localStorage.getItem("nsql_api_token");
-    await fetch("/backup/import-replace", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      },
-      body: JSON.stringify(backup),
-    });
-
-    setImporting(false);
-    setImportDone(true);
-    setTimeout(() => setImportDone(false), 3000);
-    e.target.value = "";
   };
 
   return (
@@ -92,7 +87,6 @@ export default function BackupPage({ user }) {
         <p className="text-xs text-muted-foreground mt-0.5">Full system data import / export. Admin only.</p>
       </div>
 
-      {/* Export */}
       <div className="bg-card border border-border rounded-lg p-5 space-y-4">
         <div>
           <h3 className="text-xs font-semibold text-foreground">Export All Data</h3>
@@ -115,6 +109,12 @@ export default function BackupPage({ user }) {
           </div>
         )}
 
+        {exportError && (
+          <p className="text-xs text-destructive flex items-center gap-1">
+            <AlertTriangle className="w-3 h-3" /> {exportError}
+          </p>
+        )}
+
         <button
           onClick={handleExport}
           disabled={exporting}
@@ -124,7 +124,6 @@ export default function BackupPage({ user }) {
         </button>
       </div>
 
-      {/* Import */}
       <div className="bg-card border border-border rounded-lg p-5 space-y-4">
         <div>
           <h3 className="text-xs font-semibold text-foreground">Import Data</h3>
@@ -151,7 +150,6 @@ export default function BackupPage({ user }) {
         )}
       </div>
 
-      {/* Data overview */}
       <div className="bg-card border border-border rounded-lg p-5 space-y-3">
         <h3 className="text-[10px] font-semibold text-muted-foreground uppercase tracking-widest">What Gets Exported</h3>
         <div className="space-y-2">

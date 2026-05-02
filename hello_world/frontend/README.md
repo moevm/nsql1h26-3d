@@ -1,31 +1,24 @@
-# Frontend (интеграция с local backend API)
+## Требования
+- **Node.js** (версия 18 или выше)
+- **npm** или **yarn**
 
-## Запуск
+## Быстрый старт
 
-```bash
-npm install
-npm run dev
-```
+1. **Установка зависимостей:**
+   ```bash
+   npm install
+   ```
 
-Приложение: `http://localhost:5173`.
-Ожидается backend API на `http://localhost:8000` (через Vite proxy).
+2. **Настройка окружения:**
+   В корне папки `frontend/` создайте файл `.env`. 
+   Укажите в нем адрес вашего запущенного бэкенда:
+   ```env
+   VITE_API_URL=https://ozon.milf-ai.ru
+   ```
+   *Примечание: Все запросы к API проксируются через Vite для обхода ограничений CORS.*
 
-## Авторизация
-
-Фронт работает с bearer-токеном (`localStorage` ключ `nsql_api_token`) и API:
-- `POST /auth/login`
-- `GET /auth/me`
-- `POST /auth/logout`
-
-По умолчанию используется seed admin (`admin@local.dev / admin123`), если токен отсутствует.
-
-## Поддерживаемые сущности
-
-- `Dataset`
-- `BenchmarkResult`
-- `BenchmarkResultStatusEvent`
-- `User`
-
-Импорт/экспорт выполняется через backend:
-- `POST /backup/export`
-- `POST /backup/import-replace`
+3. **Запуск приложения:**
+   ```bash
+   npm run dev
+   ```
+   После запуска приложение будет доступно по адресу: `http://localhost:5173`

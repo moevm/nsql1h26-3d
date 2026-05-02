@@ -1,5 +1,5 @@
 const API_BASE = import.meta.env.VITE_API_BASE ?? "";
-const TOKEN_KEY = "pointcloud_token";
+export const TOKEN_KEY = "pointcloud_token";
 
 function getToken() {
   return localStorage.getItem(TOKEN_KEY);
@@ -35,12 +35,15 @@ function entityApi(name) {
   return {
     list: (orderBy, limit) =>
       api(`/entities/${name}/list?orderBy=${encodeURIComponent(orderBy || "-created_date")}&limit=${limit ?? 100}`),
-    filter: (filter, orderBy, limit) =>
-      api(
-        `/entities/${name}/filter?filter=${encodeURIComponent(JSON.stringify(filter ?? {}))}&orderBy=${encodeURIComponent(
-          orderBy || "-created_date"
-        )}&limit=${limit ?? 100}`
-      ),
+    filter: (filter, orderBy, limit, skip, options) => {
+      const params = new URLSearchParams();
+      params.set("filter", JSON.stringify(filter ?? {}));
+      params.set("orderBy", orderBy || "-created_date");
+      params.set("limit", String(limit ?? 100));
+      if (skip != null && skip > 0) params.set("skip", String(skip));
+      if (options?.countTotal) params.set("countTotal", "true");
+      return api(`/entities/${name}/filter?${params.toString()}`);
+    },
     get: (id) => api(`/entities/${name}/${id}`),
     create: (data) => api(`/entities/${name}`, { method: "POST", body: { data } }),
     update: (id, data) => api(`/entities/${name}/${id}`, { method: "PATCH", body: { data } }),
@@ -97,6 +100,13 @@ export const pointCloud = {
         method: "POST",
         body: { dataset_id, algorithm },
       }),
+  },
+  backup: {
+    export: () => api("/backup/export", { method: "POST" }),
+    importReplace: (payload) => api("/backup/import-replace", { method: "POST", body: payload }),
+  },
+  datasets: {
+    query: (body) => api("/datasets/query", { method: "POST", body }),
   },
   entities: {
     Dataset: entityApi("Dataset"),
