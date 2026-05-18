@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -9,6 +10,7 @@ import tracemalloc
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 from bson import ObjectId
@@ -74,6 +76,16 @@ DATASET_FILTER_FIELDS = frozenset({"source", "created_by", "is_public", "name", 
 BENCHMARK_FILTER_FIELDS = frozenset({"dataset_id", "dataset_name", "algorithm", "status", "created_by", "comment"})
 USER_FILTER_FIELDS = frozenset({"email", "role", "full_name", "display_name"})
 EVENT_FILTER_FIELDS = frozenset({"result_id", "from_status", "to_status"})
+DEFAULT_GENERATED_POINT_COUNT = 10000
+BENCHMARK_POINT_LIMIT = 50000
+SPATIAL_BOUND_ALIASES = {
+    "x_min": ("x_min", "xMin", "min_x", "minX"),
+    "x_max": ("x_max", "xMax", "max_x", "maxX"),
+    "y_min": ("y_min", "yMin", "min_y", "minY"),
+    "y_max": ("y_max", "yMax", "max_y", "maxY"),
+    "z_min": ("z_min", "zMin", "min_z", "minZ"),
+    "z_max": ("z_max", "zMax", "max_z", "maxZ"),
+}
 
 
 def _merge_and(parts: list[dict[str, Any]], base: dict[str, Any]) -> dict[str, Any]:
@@ -223,9 +235,36 @@ def build_seed_from_dataset(dataset: dict[str, Any]) -> int:
     return int(digest[:16], 16) % (2**32)
 
 
-def generate_dataset_points(dataset: dict[str, Any]) -> np.ndarray:
-    count = int(dataset.get("point_count") or 10000)
-    count = max(1000, min(count, 50000))
+def coerce_dataset_point_count(
+    dataset: dict[str, Any],
+    *,
+    default: int = DEFAULT_GENERATED_POINT_COUNT,
+    min_points: int = 0,
+    max_points: Optional[int] = None,
+) -> int:
+    raw = dataset.get("point_count")
+    if raw is None or raw == "":
+        count = default
+    else:
+        try:
+            count = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Dataset point_count must be an integer") from exc
+    if count < 0:
+        raise ValueError("Dataset point_count must be non-negative")
+    count = max(min_points, count)
+    if max_points is not None:
+        count = min(count, max_points)
+    return count
+
+
+def generate_dataset_points(
+    dataset: dict[str, Any],
+    *,
+    min_points: int = 1000,
+    max_points: Optional[int] = BENCHMARK_POINT_LIMIT,
+) -> np.ndarray:
+    count = coerce_dataset_point_count(dataset, min_points=min_points, max_points=max_points)
     source = (dataset.get("source") or "generated_random").lower()
     rng = np.random.default_rng(build_seed_from_dataset(dataset))
 
@@ -256,6 +295,291 @@ def generate_dataset_points(dataset: dict[str, Any]) -> np.ndarray:
         return np.column_stack((x, y, z)).astype(np.float32)
 
     return rng.uniform(-1.0, 1.0, (count, 3)).astype(np.float32)
+
+
+def _split_point_line(line: str) -> list[str]:
+    return [token for token in re.split(r"[\s,;]+", line.strip()) if token]
+
+
+def _finite_float(value: str) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except ValueError:
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _axis_indexes(tokens: list[str]) -> Optional[tuple[int, int, int]]:
+    lowered = [token.strip().lower() for token in tokens]
+    try:
+        return lowered.index("x"), lowered.index("y"), lowered.index("z")
+    except ValueError:
+        return None
+
+
+def _xyz_from_tokens(
+    tokens: list[str],
+    indexes: Optional[tuple[int, int, int]] = None,
+) -> Optional[tuple[float, float, float]]:
+    if indexes is not None:
+        try:
+            values = [_finite_float(tokens[index]) for index in indexes]
+        except IndexError:
+            return None
+        if any(value is None for value in values):
+            return None
+        return values[0], values[1], values[2]
+
+    values: list[float] = []
+    for token in tokens:
+        parsed = _finite_float(token)
+        if parsed is not None:
+            values.append(parsed)
+        if len(values) == 3:
+            return values[0], values[1], values[2]
+    return None
+
+
+def _points_to_array(points: list[tuple[float, float, float]], source_name: str) -> np.ndarray:
+    if not points:
+        raise ValueError(f"{source_name} does not contain readable x/y/z points")
+    return np.asarray(points, dtype=np.float32)
+
+
+def _load_delimited_points(path: Path) -> np.ndarray:
+    points: list[tuple[float, float, float]] = []
+    indexes: Optional[tuple[int, int, int]] = None
+    checked_header = False
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or stripped.startswith("//"):
+                continue
+            tokens = _split_point_line(stripped)
+            if not tokens:
+                continue
+            if not checked_header:
+                checked_header = True
+                indexes = _axis_indexes(tokens)
+                if indexes is not None:
+                    continue
+            xyz = _xyz_from_tokens(tokens, indexes)
+            if xyz is not None:
+                points.append(xyz)
+    return _points_to_array(points, path.name)
+
+
+def _load_ascii_ply_points(path: Path) -> np.ndarray:
+    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    if not lines or lines[0].strip().lower() != "ply":
+        return _load_delimited_points(path)
+
+    vertex_count: Optional[int] = None
+    vertex_properties: list[str] = []
+    reading_vertex_properties = False
+    header_end: Optional[int] = None
+    is_ascii = False
+
+    for line_no, line in enumerate(lines):
+        stripped = line.strip()
+        lowered = stripped.lower()
+        parts = _split_point_line(stripped)
+        if lowered.startswith("format "):
+            is_ascii = len(parts) >= 2 and parts[1].lower() == "ascii"
+        elif len(parts) >= 3 and parts[0].lower() == "element":
+            reading_vertex_properties = parts[1].lower() == "vertex"
+            if reading_vertex_properties:
+                try:
+                    vertex_count = int(parts[2])
+                except ValueError as exc:
+                    raise ValueError("PLY vertex count must be an integer") from exc
+        elif reading_vertex_properties and len(parts) >= 3 and parts[0].lower() == "property":
+            vertex_properties.append(parts[-1].lower())
+        elif lowered == "end_header":
+            header_end = line_no + 1
+            break
+
+    if not is_ascii:
+        raise ValueError("Only ASCII PLY point files are supported")
+    if header_end is None or vertex_count is None:
+        raise ValueError("PLY file is missing vertex header")
+    try:
+        indexes = (
+            vertex_properties.index("x"),
+            vertex_properties.index("y"),
+            vertex_properties.index("z"),
+        )
+    except ValueError as exc:
+        raise ValueError("PLY vertex properties must include x, y, z") from exc
+
+    points: list[tuple[float, float, float]] = []
+    for line in lines[header_end : header_end + vertex_count]:
+        xyz = _xyz_from_tokens(_split_point_line(line), indexes)
+        if xyz is not None:
+            points.append(xyz)
+    return _points_to_array(points, path.name)
+
+
+def _load_ascii_pcd_points(path: Path) -> np.ndarray:
+    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    fields: list[str] = []
+    point_count: Optional[int] = None
+    data_start: Optional[int] = None
+
+    for line_no, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = _split_point_line(stripped)
+        if not parts:
+            continue
+        key = parts[0].upper()
+        if key == "FIELDS":
+            fields = [part.lower() for part in parts[1:]]
+        elif key == "POINTS" and len(parts) >= 2:
+            try:
+                point_count = int(parts[1])
+            except ValueError as exc:
+                raise ValueError("PCD POINTS value must be an integer") from exc
+        elif key == "DATA":
+            if len(parts) < 2 or parts[1].lower() != "ascii":
+                raise ValueError("Only ASCII PCD point files are supported")
+            data_start = line_no + 1
+            break
+
+    if data_start is None:
+        return _load_delimited_points(path)
+    indexes = _axis_indexes(fields)
+    if indexes is None:
+        raise ValueError("PCD FIELDS must include x, y, z")
+
+    rows = lines[data_start:]
+    if point_count is not None:
+        rows = rows[:point_count]
+    points: list[tuple[float, float, float]] = []
+    for line in rows:
+        xyz = _xyz_from_tokens(_split_point_line(line), indexes)
+        if xyz is not None:
+            points.append(xyz)
+    return _points_to_array(points, path.name)
+
+
+def _uploaded_file_path(dataset: dict[str, Any]) -> Path:
+    file_url = dataset.get("file_url")
+    if not file_url:
+        raise ValueError("Uploaded dataset is missing file_url")
+    parsed_path = unquote(urlparse(str(file_url)).path)
+    file_name = Path(parsed_path).name
+    if not file_name:
+        raise ValueError("Uploaded dataset file_url is invalid")
+    path = (UPLOAD_DIR / file_name).resolve()
+    upload_root = UPLOAD_DIR.resolve()
+    if path.parent != upload_root:
+        raise ValueError("Uploaded dataset path is outside upload directory")
+    if not path.exists():
+        raise ValueError(f"Uploaded dataset file not found: {file_name}")
+    return path
+
+
+def load_uploaded_dataset_points(dataset: dict[str, Any]) -> np.ndarray:
+    path = _uploaded_file_path(dataset)
+    suffix = path.suffix.lower()
+    if suffix == ".ply":
+        return _load_ascii_ply_points(path)
+    if suffix == ".pcd":
+        return _load_ascii_pcd_points(path)
+    if suffix == ".las":
+        raise ValueError("LAS point files are not supported without a LAS parser dependency")
+    return _load_delimited_points(path)
+
+
+def load_dataset_points(dataset: dict[str, Any]) -> np.ndarray:
+    source = (dataset.get("source") or "generated_random").lower()
+    if source == "uploaded":
+        return load_uploaded_dataset_points(dataset)
+    return generate_dataset_points(dataset, min_points=0, max_points=None)
+
+
+def normalize_range_bounds(bounds: dict[str, Any]) -> dict[str, float]:
+    if not isinstance(bounds, dict):
+        raise ValueError("Range bounds must be an object")
+
+    normalized: dict[str, float] = {}
+    missing: list[str] = []
+    for key, aliases in SPATIAL_BOUND_ALIASES.items():
+        raw_value = None
+        found = False
+        for alias in aliases:
+            if alias in bounds:
+                raw_value = bounds[alias]
+                found = True
+                break
+        if not found:
+            missing.append(key)
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Range bound {key} must be numeric") from exc
+        if not math.isfinite(value):
+            raise ValueError(f"Range bound {key} must be finite")
+        normalized[key] = value
+
+    if missing:
+        raise ValueError(f"Missing range bounds: {', '.join(missing)}")
+
+    for axis in ("x", "y", "z"):
+        mn = normalized[f"{axis}_min"]
+        mx = normalized[f"{axis}_max"]
+        if mn > mx:
+            raise ValueError(f"Range bound {axis}_min must be <= {axis}_max")
+
+    return normalized
+
+
+def ensure_point_array(points: np.ndarray) -> np.ndarray:
+    arr = np.asarray(points, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        raise ValueError("Points must be a Nx3 array")
+    return arr
+
+
+def count_points_in_bounds(points: np.ndarray, bounds: dict[str, Any]) -> int:
+    normalized = normalize_range_bounds(bounds)
+    arr = ensure_point_array(points)
+    return _count_points_in_normalized_bounds(arr, normalized)
+
+
+def _count_points_in_normalized_bounds(points: np.ndarray, normalized: dict[str, float]) -> int:
+    mins = np.array([normalized["x_min"], normalized["y_min"], normalized["z_min"]], dtype=np.float32)
+    maxs = np.array([normalized["x_max"], normalized["y_max"], normalized["z_max"]], dtype=np.float32)
+    mask = np.all((points >= mins) & (points <= maxs), axis=1)
+    return int(np.count_nonzero(mask))
+
+
+def brute_force_range_query(points: np.ndarray, bounds: dict[str, Any]) -> dict[str, Any]:
+    normalized = normalize_range_bounds(bounds)
+    arr = ensure_point_array(points)
+    started = time.perf_counter()
+    count = _count_points_in_normalized_bounds(arr, normalized)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    return {
+        "count": count,
+        "point_count": int(len(arr)),
+        "brute_time_ms": round(elapsed_ms, 3),
+        "bounds": normalized,
+    }
+
+
+def brute_force_dataset_range_query(dataset: dict[str, Any], bounds: dict[str, Any]) -> dict[str, Any]:
+    points = load_dataset_points(dataset)
+    result = brute_force_range_query(points, bounds)
+    dataset_id = dataset.get("_id") or dataset.get("id")
+    result["dataset_id"] = str(dataset_id) if dataset_id is not None else ""
+    result["dataset_name"] = dataset.get("name", "")
+    return result
 
 
 def benchmark_kdtree(points: np.ndarray) -> tuple[Any, Any]:
