@@ -44,6 +44,28 @@ const ALGORITHMS = [
   { id: "hilbert", label: "Hilbert Curve" },
 ];
 
+const RANGE_BOUND_KEYS = ["xMin", "xMax", "yMin", "yMax", "zMin", "zMax"];
+
+function formatMs(value) {
+  if (value == null) return "—";
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "—";
+  return numeric.toLocaleString(undefined, { maximumFractionDigits: 3 });
+}
+
+function getApiErrorMessage(error) {
+  const fallback = String(error?.message || error || "Range query failed");
+  try {
+    const parsed = JSON.parse(fallback);
+    if (typeof parsed.detail === "string") return parsed.detail;
+    if (Array.isArray(parsed.detail)) {
+      return parsed.detail.map(item => item.msg || item.message || JSON.stringify(item)).join("; ");
+    }
+  } catch {
+  }
+  return fallback;
+}
+
 export default function Dashboard() {
   const [user, setUser] = useState(null);
   const [userLoading, setUserLoading] = useState(true);
@@ -65,6 +87,7 @@ export default function Dashboard() {
   const [rangeBounds, setRangeBounds] = useState({ xMin: -0.5, xMax: 0.5, yMin: -0.5, yMax: 0.5, zMin: -0.5, zMax: 0.5 });
   const [rangeQueryRunning, setRangeQueryRunning] = useState(false);
   const [rangeQueryResult, setRangeQueryResult] = useState(null);
+  const [rangeQueryError, setRangeQueryError] = useState("");
   const [spatialIndexes, setSpatialIndexes] = useState([]);
   const [selectedIndexAlgo, setSelectedIndexAlgo] = useState("");
   const [spatialIndexesLoading, setSpatialIndexesLoading] = useState(false);
@@ -132,6 +155,8 @@ export default function Dashboard() {
       setDatasetBenchmarkResults([]);
       setEditingName("");
       setEditingComment("");
+      setRangeQueryResult(null);
+      setRangeQueryError("");
       return;
     }
     const dsId = selectedDataset.id;
@@ -165,6 +190,7 @@ export default function Dashboard() {
     setCloudType(SOURCE_TO_CLOUD[ds.source] || "random");
     setBenchmarkResults([]);
     setRangeQueryResult(null);
+    setRangeQueryError("");
     setRunningAlgos(new Set());
   };
 
@@ -222,15 +248,50 @@ export default function Dashboard() {
 
   const handleRunRangeQuery = useCallback(async () => {
     if (!selectedDataset || !selectedIndexAlgo) return;
+    const bounds = {};
+    for (const key of RANGE_BOUND_KEYS) {
+      const value = Number(rangeBounds[key]);
+      if (!Number.isFinite(value)) {
+        const message = "Enter numeric values for all range bounds.";
+        setRangeQueryError(message);
+        setRangeQueryResult(null);
+        return;
+      }
+      bounds[key] = value;
+    }
+
     setRangeQueryRunning(true);
     setRangeQueryResult(null);
-    await new Promise(r => setTimeout(r, 400 + Math.random() * 600));
-    const count = Math.floor(Math.random() * (selectedDataset.point_count || 50000) * 0.1);
-    const indexTimeMs = (0.5 + Math.random() * 2).toFixed(2);
-    const bruteTimeMs = (5 + Math.random() * 20).toFixed(2);
-    setRangeQueryResult({ count, indexTimeMs, bruteTimeMs, algorithm: selectedIndexAlgo });
-    setRangeQueryRunning(false);
-  }, [selectedDataset, selectedIndexAlgo]);
+    setRangeQueryError("");
+    try {
+      const result = await pointCloud.spatial.rangeQuery({
+        dataset_id: selectedDataset.id,
+        algorithm: selectedIndexAlgo,
+        bounds,
+      });
+      setRangeQueryResult({
+        algorithm: result.algorithm || selectedIndexAlgo,
+        count: Number(result.count ?? 0),
+        indexedCount: Number(result.indexed_count ?? result.count ?? 0),
+        bruteCount: Number(result.brute_count ?? result.count ?? 0),
+        pointCount: Number(result.point_count ?? selectedDataset.point_count ?? 0),
+        indexTimeMs: result.index_time_ms ?? result.indexed_time_ms,
+        bruteTimeMs: result.brute_time_ms,
+        indexBuildTimeMs: result.index_build_time_ms,
+        candidateCount: result.candidate_count,
+        bucketCount: result.bucket_count,
+        visitedBucketCount: result.visited_bucket_count,
+        indexKind: result.index_kind,
+        emptyResult: Boolean(result.empty_result),
+      });
+    } catch (error) {
+      const message = getApiErrorMessage(error);
+      setRangeQueryError(message);
+      toast({ title: "Range query failed", description: message, variant: "destructive" });
+    } finally {
+      setRangeQueryRunning(false);
+    }
+  }, [selectedDataset, selectedIndexAlgo, rangeBounds]);
 
   useEffect(() => {
     if (runningAlgos.size === 0 || !settings.liveMetrics) return;
@@ -491,7 +552,11 @@ export default function Dashboard() {
                       <div className="relative max-w-xs">
                         <select
                           value={selectedIndexAlgo}
-                          onChange={e => setSelectedIndexAlgo(e.target.value)}
+                          onChange={e => {
+                            setSelectedIndexAlgo(e.target.value);
+                            setRangeQueryResult(null);
+                            setRangeQueryError("");
+                          }}
                           className="w-full appearance-none bg-secondary border border-border rounded-md px-3 py-2 text-xs text-foreground cursor-pointer focus:outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/30"
                         >
                           {spatialIndexes.map(algo => (
@@ -507,14 +572,18 @@ export default function Dashboard() {
                 <div>
                   <span className="text-[10px] font-mono text-muted-foreground uppercase tracking-widest">Range bounds (X, Y, Z)</span>
                   <div className="grid grid-cols-2 gap-x-3 gap-y-2 mt-2">
-                    {["xMin", "xMax", "yMin", "yMax", "zMin", "zMax"].map(key => (
+                    {RANGE_BOUND_KEYS.map(key => (
                       <div key={key} className="flex items-center gap-2">
                         <label className="text-[10px] text-muted-foreground w-10">{key}</label>
                         <input
                           type="number"
                           step="any"
                           value={rangeBounds[key]}
-                          onChange={e => setRangeBounds(prev => ({ ...prev, [key]: parseFloat(e.target.value) ?? 0 }))}
+                          onChange={e => {
+                            setRangeBounds(prev => ({ ...prev, [key]: e.target.value }));
+                            setRangeQueryResult(null);
+                            setRangeQueryError("");
+                          }}
                           className="flex-1 bg-secondary border border-border rounded px-3 py-2 text-xs font-mono text-foreground focus:outline-none focus:border-primary/50"
                         />
                       </div>
@@ -528,14 +597,31 @@ export default function Dashboard() {
                 >
                   {rangeQueryRunning ? <><Loader2 className="w-4 h-4 animate-spin" /> Querying…</> : "Run range query"}
                 </button>
+                {rangeQueryError && (
+                  <p className="text-xs text-destructive border border-destructive/30 bg-destructive/10 rounded-md px-3 py-2">
+                    {rangeQueryError}
+                  </p>
+                )}
                 {rangeQueryResult && (
                   <div className="pt-4 border-t border-border space-y-2 text-xs font-mono">
                     <p className="text-muted-foreground">Points in range: <span className="text-foreground font-semibold">{rangeQueryResult.count.toLocaleString()}</span></p>
+                    {rangeQueryResult.emptyResult && (
+                      <p className="text-yellow-400">No points matched this range.</p>
+                    )}
                     <p className="text-cyan">
                       Index query{rangeQueryResult.algorithm ? ` (${rangeQueryResult.algorithm.toUpperCase()})` : ""}:{" "}
-                      <span className="text-foreground">{rangeQueryResult.indexTimeMs} ms</span>
+                      <span className="text-foreground">{formatMs(rangeQueryResult.indexTimeMs)} ms</span>
                     </p>
-                    <p className="text-muted-foreground">Brute-force: <span className="text-foreground">{rangeQueryResult.bruteTimeMs} ms</span></p>
+                    <p className="text-muted-foreground">Brute-force: <span className="text-foreground">{formatMs(rangeQueryResult.bruteTimeMs)} ms</span></p>
+                    <p className="text-muted-foreground">Index build in request: <span className="text-foreground">{formatMs(rangeQueryResult.indexBuildTimeMs)} ms</span></p>
+                    <p className="text-muted-foreground">
+                      Verified count: <span className="text-foreground">{rangeQueryResult.indexedCount.toLocaleString()} indexed / {rangeQueryResult.bruteCount.toLocaleString()} brute</span>
+                    </p>
+                    <p className="text-muted-foreground">
+                      Candidates: <span className="text-foreground">{Number(rangeQueryResult.candidateCount ?? 0).toLocaleString()}</span>
+                      {" "}· Buckets: <span className="text-foreground">{Number(rangeQueryResult.visitedBucketCount ?? 0).toLocaleString()}/{Number(rangeQueryResult.bucketCount ?? 0).toLocaleString()}</span>
+                      {rangeQueryResult.indexKind ? <> · <span className="text-foreground">{rangeQueryResult.indexKind}</span></> : null}
+                    </p>
                   </div>
                 )}
               </div>
