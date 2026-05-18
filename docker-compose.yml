@@ -22,11 +22,12 @@ services:
     build:
       context: ./service/frontend
       args:
+        - VITE_API_BASE=/api
         - VITE_API_URL=http://backend:8000
     container_name: frontend_app
     restart: always
     ports:
-      - "127.0.0.1:5173:5173"
+      - "127.0.0.1:5173:80"
     environment:
       - VITE_API_URL=http://backend:8000
     depends_on:
