@@ -17,21 +17,25 @@ services:
       - MONGO_URL=mongodb://db:27017
     depends_on:
       - db
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8000/health || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
   frontend:
     build:
       context: ./service/frontend
       args:
         - VITE_API_BASE=/api
-        - VITE_API_URL=http://backend:8000
     container_name: frontend_app
     restart: always
     ports:
       - "127.0.0.1:5173:80"
-    environment:
-      - VITE_API_URL=http://backend:8000
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
 
 volumes:
   mongo_data:
