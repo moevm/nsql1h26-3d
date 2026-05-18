@@ -101,6 +101,13 @@ export const pointCloud = {
         body: { dataset_id, algorithm },
       }),
   },
+  spatial: {
+    rangeQuery: ({ dataset_id, algorithm, bounds }) =>
+      api("/spatial/range-query", {
+        method: "POST",
+        body: { dataset_id, algorithm, bounds },
+      }),
+  },
   backup: {
     export: () => api("/backup/export", { method: "POST" }),
     importReplace: (payload) => api("/backup/import-replace", { method: "POST", body: payload }),

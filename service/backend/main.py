@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -9,11 +10,13 @@ import tracemalloc
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 from bson import ObjectId
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Security, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from hilbertcurve.hilbertcurve import HilbertCurve
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -35,6 +38,7 @@ logger = logging.getLogger("uvicorn.error")
 
 client: Optional[AsyncIOMotorClient] = None
 db = None
+bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def now_iso() -> str:
@@ -74,6 +78,33 @@ DATASET_FILTER_FIELDS = frozenset({"source", "created_by", "is_public", "name", 
 BENCHMARK_FILTER_FIELDS = frozenset({"dataset_id", "dataset_name", "algorithm", "status", "created_by", "comment"})
 USER_FILTER_FIELDS = frozenset({"email", "role", "full_name", "display_name"})
 EVENT_FILTER_FIELDS = frozenset({"result_id", "from_status", "to_status"})
+DEFAULT_GENERATED_POINT_COUNT = 10000
+BENCHMARK_POINT_LIMIT = 50000
+SPATIAL_BOUND_ALIASES = {
+    "x_min": ("x_min", "xMin", "min_x", "minX"),
+    "x_max": ("x_max", "xMax", "max_x", "maxX"),
+    "y_min": ("y_min", "yMin", "min_y", "minY"),
+    "y_max": ("y_max", "yMax", "max_y", "maxY"),
+    "z_min": ("z_min", "zMin", "min_z", "minZ"),
+    "z_max": ("z_max", "zMax", "max_z", "maxZ"),
+}
+SPATIAL_ALGORITHM_ALIASES = {
+    "kdtree": "kdtree",
+    "kd": "kdtree",
+    "octree": "octree",
+    "balltree": "balltree",
+    "rtree": "rtree",
+    "bvh": "bvh",
+    "svo": "svo",
+    "sparsevoxeloctree": "svo",
+    "phtree": "phtree",
+    "morton": "morton",
+    "mortoncode": "morton",
+    "zorder": "morton",
+    "hilbert": "hilbert",
+    "hilbertcurve": "hilbert",
+}
+SPATIAL_RANGE_ALGORITHMS = frozenset(SPATIAL_ALGORITHM_ALIASES.values())
 
 
 def _merge_and(parts: list[dict[str, Any]], base: dict[str, Any]) -> dict[str, Any]:
@@ -223,9 +254,36 @@ def build_seed_from_dataset(dataset: dict[str, Any]) -> int:
     return int(digest[:16], 16) % (2**32)
 
 
-def generate_dataset_points(dataset: dict[str, Any]) -> np.ndarray:
-    count = int(dataset.get("point_count") or 10000)
-    count = max(1000, min(count, 50000))
+def coerce_dataset_point_count(
+    dataset: dict[str, Any],
+    *,
+    default: int = DEFAULT_GENERATED_POINT_COUNT,
+    min_points: int = 0,
+    max_points: Optional[int] = None,
+) -> int:
+    raw = dataset.get("point_count")
+    if raw is None or raw == "":
+        count = default
+    else:
+        try:
+            count = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Dataset point_count must be an integer") from exc
+    if count < 0:
+        raise ValueError("Dataset point_count must be non-negative")
+    count = max(min_points, count)
+    if max_points is not None:
+        count = min(count, max_points)
+    return count
+
+
+def generate_dataset_points(
+    dataset: dict[str, Any],
+    *,
+    min_points: int = 1000,
+    max_points: Optional[int] = BENCHMARK_POINT_LIMIT,
+) -> np.ndarray:
+    count = coerce_dataset_point_count(dataset, min_points=min_points, max_points=max_points)
     source = (dataset.get("source") or "generated_random").lower()
     rng = np.random.default_rng(build_seed_from_dataset(dataset))
 
@@ -256,6 +314,539 @@ def generate_dataset_points(dataset: dict[str, Any]) -> np.ndarray:
         return np.column_stack((x, y, z)).astype(np.float32)
 
     return rng.uniform(-1.0, 1.0, (count, 3)).astype(np.float32)
+
+
+def _split_point_line(line: str) -> list[str]:
+    return [token for token in re.split(r"[\s,;]+", line.strip()) if token]
+
+
+def _finite_float(value: str) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except ValueError:
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _axis_indexes(tokens: list[str]) -> Optional[tuple[int, int, int]]:
+    lowered = [token.strip().lower() for token in tokens]
+    try:
+        return lowered.index("x"), lowered.index("y"), lowered.index("z")
+    except ValueError:
+        return None
+
+
+def _xyz_from_tokens(
+    tokens: list[str],
+    indexes: Optional[tuple[int, int, int]] = None,
+) -> Optional[tuple[float, float, float]]:
+    if indexes is not None:
+        try:
+            values = [_finite_float(tokens[index]) for index in indexes]
+        except IndexError:
+            return None
+        if any(value is None for value in values):
+            return None
+        return values[0], values[1], values[2]
+
+    values: list[float] = []
+    for token in tokens:
+        parsed = _finite_float(token)
+        if parsed is not None:
+            values.append(parsed)
+        if len(values) == 3:
+            return values[0], values[1], values[2]
+    return None
+
+
+def _points_to_array(points: list[tuple[float, float, float]], source_name: str) -> np.ndarray:
+    if not points:
+        raise ValueError(f"{source_name} does not contain readable x/y/z points")
+    return np.asarray(points, dtype=np.float32)
+
+
+def _load_delimited_points(path: Path) -> np.ndarray:
+    points: list[tuple[float, float, float]] = []
+    indexes: Optional[tuple[int, int, int]] = None
+    checked_header = False
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or stripped.startswith("//"):
+                continue
+            tokens = _split_point_line(stripped)
+            if not tokens:
+                continue
+            if not checked_header:
+                checked_header = True
+                indexes = _axis_indexes(tokens)
+                if indexes is not None:
+                    continue
+            xyz = _xyz_from_tokens(tokens, indexes)
+            if xyz is not None:
+                points.append(xyz)
+    return _points_to_array(points, path.name)
+
+
+def _load_ascii_ply_points(path: Path) -> np.ndarray:
+    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    if not lines or lines[0].strip().lower() != "ply":
+        return _load_delimited_points(path)
+
+    vertex_count: Optional[int] = None
+    vertex_properties: list[str] = []
+    reading_vertex_properties = False
+    header_end: Optional[int] = None
+    is_ascii = False
+
+    for line_no, line in enumerate(lines):
+        stripped = line.strip()
+        lowered = stripped.lower()
+        parts = _split_point_line(stripped)
+        if lowered.startswith("format "):
+            is_ascii = len(parts) >= 2 and parts[1].lower() == "ascii"
+        elif len(parts) >= 3 and parts[0].lower() == "element":
+            reading_vertex_properties = parts[1].lower() == "vertex"
+            if reading_vertex_properties:
+                try:
+                    vertex_count = int(parts[2])
+                except ValueError as exc:
+                    raise ValueError("PLY vertex count must be an integer") from exc
+        elif reading_vertex_properties and len(parts) >= 3 and parts[0].lower() == "property":
+            vertex_properties.append(parts[-1].lower())
+        elif lowered == "end_header":
+            header_end = line_no + 1
+            break
+
+    if not is_ascii:
+        raise ValueError("Only ASCII PLY point files are supported")
+    if header_end is None or vertex_count is None:
+        raise ValueError("PLY file is missing vertex header")
+    try:
+        indexes = (
+            vertex_properties.index("x"),
+            vertex_properties.index("y"),
+            vertex_properties.index("z"),
+        )
+    except ValueError as exc:
+        raise ValueError("PLY vertex properties must include x, y, z") from exc
+
+    points: list[tuple[float, float, float]] = []
+    for line in lines[header_end : header_end + vertex_count]:
+        xyz = _xyz_from_tokens(_split_point_line(line), indexes)
+        if xyz is not None:
+            points.append(xyz)
+    return _points_to_array(points, path.name)
+
+
+def _load_ascii_pcd_points(path: Path) -> np.ndarray:
+    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    fields: list[str] = []
+    point_count: Optional[int] = None
+    data_start: Optional[int] = None
+
+    for line_no, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = _split_point_line(stripped)
+        if not parts:
+            continue
+        key = parts[0].upper()
+        if key == "FIELDS":
+            fields = [part.lower() for part in parts[1:]]
+        elif key == "POINTS" and len(parts) >= 2:
+            try:
+                point_count = int(parts[1])
+            except ValueError as exc:
+                raise ValueError("PCD POINTS value must be an integer") from exc
+        elif key == "DATA":
+            if len(parts) < 2 or parts[1].lower() != "ascii":
+                raise ValueError("Only ASCII PCD point files are supported")
+            data_start = line_no + 1
+            break
+
+    if data_start is None:
+        return _load_delimited_points(path)
+    indexes = _axis_indexes(fields)
+    if indexes is None:
+        raise ValueError("PCD FIELDS must include x, y, z")
+
+    rows = lines[data_start:]
+    if point_count is not None:
+        rows = rows[:point_count]
+    points: list[tuple[float, float, float]] = []
+    for line in rows:
+        xyz = _xyz_from_tokens(_split_point_line(line), indexes)
+        if xyz is not None:
+            points.append(xyz)
+    return _points_to_array(points, path.name)
+
+
+def _uploaded_file_path(dataset: dict[str, Any]) -> Path:
+    file_url = dataset.get("file_url")
+    if not file_url:
+        raise ValueError("Uploaded dataset is missing file_url")
+    parsed_path = unquote(urlparse(str(file_url)).path)
+    file_name = Path(parsed_path).name
+    if not file_name:
+        raise ValueError("Uploaded dataset file_url is invalid")
+    path = (UPLOAD_DIR / file_name).resolve()
+    upload_root = UPLOAD_DIR.resolve()
+    if path.parent != upload_root:
+        raise ValueError("Uploaded dataset path is outside upload directory")
+    if not path.exists():
+        raise ValueError(f"Uploaded dataset file not found: {file_name}")
+    return path
+
+
+def load_uploaded_dataset_points(dataset: dict[str, Any]) -> np.ndarray:
+    path = _uploaded_file_path(dataset)
+    suffix = path.suffix.lower()
+    if suffix == ".ply":
+        return _load_ascii_ply_points(path)
+    if suffix == ".pcd":
+        return _load_ascii_pcd_points(path)
+    if suffix == ".las":
+        raise ValueError("LAS point files are not supported without a LAS parser dependency")
+    return _load_delimited_points(path)
+
+
+def load_dataset_points(dataset: dict[str, Any]) -> np.ndarray:
+    source = (dataset.get("source") or "generated_random").lower()
+    if source == "uploaded":
+        return load_uploaded_dataset_points(dataset)
+    return generate_dataset_points(dataset, min_points=0, max_points=None)
+
+
+def normalize_range_bounds(bounds: dict[str, Any]) -> dict[str, float]:
+    if not isinstance(bounds, dict):
+        raise ValueError("Range bounds must be an object")
+
+    normalized: dict[str, float] = {}
+    missing: list[str] = []
+    for key, aliases in SPATIAL_BOUND_ALIASES.items():
+        raw_value = None
+        found = False
+        for alias in aliases:
+            if alias in bounds:
+                raw_value = bounds[alias]
+                found = True
+                break
+        if not found:
+            missing.append(key)
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Range bound {key} must be numeric") from exc
+        if not math.isfinite(value):
+            raise ValueError(f"Range bound {key} must be finite")
+        normalized[key] = value
+
+    if missing:
+        raise ValueError(f"Missing range bounds: {', '.join(missing)}")
+
+    for axis in ("x", "y", "z"):
+        mn = normalized[f"{axis}_min"]
+        mx = normalized[f"{axis}_max"]
+        if mn > mx:
+            raise ValueError(f"Range bound {axis}_min must be <= {axis}_max")
+
+    return normalized
+
+
+def ensure_point_array(points: np.ndarray) -> np.ndarray:
+    arr = np.asarray(points, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        raise ValueError("Points must be a Nx3 array")
+    return arr
+
+
+def count_points_in_bounds(points: np.ndarray, bounds: dict[str, Any]) -> int:
+    normalized = normalize_range_bounds(bounds)
+    arr = ensure_point_array(points)
+    return _count_points_in_normalized_bounds(arr, normalized)
+
+
+def _count_points_in_normalized_bounds(points: np.ndarray, normalized: dict[str, float]) -> int:
+    mins = np.array([normalized["x_min"], normalized["y_min"], normalized["z_min"]], dtype=np.float32)
+    maxs = np.array([normalized["x_max"], normalized["y_max"], normalized["z_max"]], dtype=np.float32)
+    mask = np.all((points >= mins) & (points <= maxs), axis=1)
+    return int(np.count_nonzero(mask))
+
+
+def brute_force_range_query(points: np.ndarray, bounds: dict[str, Any]) -> dict[str, Any]:
+    normalized = normalize_range_bounds(bounds)
+    arr = ensure_point_array(points)
+    started = time.perf_counter()
+    count = _count_points_in_normalized_bounds(arr, normalized)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    return {
+        "count": count,
+        "point_count": int(len(arr)),
+        "brute_time_ms": round(elapsed_ms, 3),
+        "bounds": normalized,
+    }
+
+
+def brute_force_dataset_range_query(dataset: dict[str, Any], bounds: dict[str, Any]) -> dict[str, Any]:
+    points = load_dataset_points(dataset)
+    result = brute_force_range_query(points, bounds)
+    dataset_id = dataset.get("_id") or dataset.get("id")
+    result["dataset_id"] = str(dataset_id) if dataset_id is not None else ""
+    result["dataset_name"] = dataset.get("name", "")
+    return result
+
+
+def normalize_spatial_algorithm(algorithm: str) -> str:
+    key = re.sub(r"[^a-z0-9]+", "", (algorithm or "").lower())
+    normalized = SPATIAL_ALGORITHM_ALIASES.get(key)
+    if normalized is None:
+        supported = ", ".join(sorted(SPATIAL_RANGE_ALGORITHMS))
+        raise ValueError(f"Unsupported spatial algorithm: {algorithm}. Supported: {supported}")
+    return normalized
+
+
+def _empty_range_index(points: np.ndarray, algorithm: str, index_kind: str) -> dict[str, Any]:
+    return {
+        "algorithm": algorithm,
+        "kind": index_kind,
+        "points": points,
+        "buckets": [],
+        "mins": np.empty((0, 3), dtype=np.float32),
+        "maxs": np.empty((0, 3), dtype=np.float32),
+    }
+
+
+def _build_bucket_range_index(
+    points: np.ndarray,
+    algorithm: str,
+    index_kind: str,
+    buckets: list[np.ndarray],
+) -> dict[str, Any]:
+    if len(points) == 0 or not buckets:
+        return _empty_range_index(points, algorithm, index_kind)
+
+    mins = []
+    maxs = []
+    clean_buckets = []
+    for bucket in buckets:
+        if len(bucket) == 0:
+            continue
+        idxs = np.asarray(bucket, dtype=np.int64)
+        pts = points[idxs]
+        mins.append(np.min(pts, axis=0))
+        maxs.append(np.max(pts, axis=0))
+        clean_buckets.append(idxs)
+
+    if not clean_buckets:
+        return _empty_range_index(points, algorithm, index_kind)
+
+    return {
+        "algorithm": algorithm,
+        "kind": index_kind,
+        "points": points,
+        "buckets": clean_buckets,
+        "mins": np.asarray(mins, dtype=np.float32),
+        "maxs": np.asarray(maxs, dtype=np.float32),
+    }
+
+
+def _build_ordered_bucket_index(
+    points: np.ndarray,
+    algorithm: str,
+    index_kind: str,
+    order: np.ndarray,
+    group_size: int,
+) -> dict[str, Any]:
+    buckets = [order[i : i + group_size] for i in range(0, len(order), group_size)]
+    return _build_bucket_range_index(points, algorithm, index_kind, buckets)
+
+
+def _build_voxel_bucket_index(
+    points: np.ndarray,
+    algorithm: str,
+    bins: int,
+    *,
+    use_morton: bool = False,
+    use_hilbert: bool = False,
+) -> dict[str, Any]:
+    if len(points) == 0:
+        return _empty_range_index(points, algorithm, "voxel")
+
+    data_min = np.min(points, axis=0)
+    data_max = np.max(points, axis=0)
+    span = np.maximum(data_max - data_min, np.float32(1e-6))
+    scaled = np.floor(((points - data_min) / span) * (bins - 1)).clip(0, bins - 1).astype(np.int32)
+
+    bucket_map: dict[Any, list[int]] = {}
+    if use_morton:
+        bits = int(math.ceil(math.log2(bins)))
+        codes = _morton_codes_from_quantized(scaled.astype(np.uint32), bits)
+        for idx, code in enumerate(codes.tolist()):
+            bucket_map.setdefault(int(code), []).append(idx)
+    elif use_hilbert:
+        bits = int(math.ceil(math.log2(bins)))
+        hc = HilbertCurve(bits, 3)
+        for idx, coords in enumerate(scaled.tolist()):
+            code = hc.distance_from_point([int(coords[0]), int(coords[1]), int(coords[2])])
+            bucket_map.setdefault(int(code), []).append(idx)
+    else:
+        for idx, coords in enumerate(scaled.tolist()):
+            bucket_map.setdefault((int(coords[0]), int(coords[1]), int(coords[2])), []).append(idx)
+
+    buckets = [np.asarray(idxs, dtype=np.int64) for idxs in bucket_map.values()]
+    return _build_bucket_range_index(points, algorithm, "voxel", buckets)
+
+
+def _morton_codes_from_quantized(q: np.ndarray, bits: int) -> np.ndarray:
+    mask = np.uint32((1 << min(bits, 10)) - 1)
+    coords = q.astype(np.uint32) & mask
+
+    def part1by2(v: np.ndarray) -> np.ndarray:
+        x = v & np.uint32(0x3FF)
+        x = (x | (x << 16)) & np.uint32(0x30000FF)
+        x = (x | (x << 8)) & np.uint32(0x300F00F)
+        x = (x | (x << 4)) & np.uint32(0x30C30C3)
+        x = (x | (x << 2)) & np.uint32(0x9249249)
+        return x
+
+    return part1by2(coords[:, 0]) | (part1by2(coords[:, 1]) << 1) | (part1by2(coords[:, 2]) << 2)
+
+
+def build_spatial_range_index(points: np.ndarray, algorithm: str) -> dict[str, Any]:
+    algo = normalize_spatial_algorithm(algorithm)
+    arr = ensure_point_array(points)
+    if len(arr) == 0:
+        return _empty_range_index(arr, algo, "empty")
+
+    if algo == "kdtree":
+        order = np.lexsort((arr[:, 2], arr[:, 1], arr[:, 0]))
+        return _build_ordered_bucket_index(arr, algo, "axis-sorted", order, 32)
+    if algo == "balltree":
+        center = np.mean(arr, axis=0)
+        order = np.argsort(np.sum((arr - center) ** 2, axis=1))
+        return _build_ordered_bucket_index(arr, algo, "radial-sorted", order, 64)
+    if algo == "rtree":
+        order = np.argsort(arr[:, 0] + arr[:, 1] * 0.5 + arr[:, 2] * 0.25)
+        return _build_ordered_bucket_index(arr, algo, "bbox-groups", order, 64)
+    if algo == "bvh":
+        order = np.argsort(arr[:, 0] + arr[:, 1] * 0.31 + arr[:, 2] * 0.17)
+        return _build_ordered_bucket_index(arr, algo, "bvh-groups", order, 64)
+    if algo == "octree":
+        return _build_voxel_bucket_index(arr, algo, 32)
+    if algo == "svo":
+        return _build_voxel_bucket_index(arr, algo, 64)
+    if algo == "phtree":
+        return _build_voxel_bucket_index(arr, algo, 128)
+    if algo == "morton":
+        return _build_voxel_bucket_index(arr, algo, 64, use_morton=True)
+    if algo == "hilbert":
+        return _build_voxel_bucket_index(arr, algo, 32, use_hilbert=True)
+
+    raise ValueError(f"Unsupported spatial algorithm: {algorithm}")
+
+
+def query_spatial_range_index(index: dict[str, Any], bounds: dict[str, Any]) -> dict[str, int]:
+    normalized = normalize_range_bounds(bounds)
+    points = ensure_point_array(index["points"])
+    if len(points) == 0:
+        return {"count": 0, "candidate_count": 0, "bucket_count": 0, "visited_bucket_count": 0}
+
+    mins = np.array([normalized["x_min"], normalized["y_min"], normalized["z_min"]], dtype=np.float32)
+    maxs = np.array([normalized["x_max"], normalized["y_max"], normalized["z_max"]], dtype=np.float32)
+    bucket_mins = index["mins"]
+    bucket_maxs = index["maxs"]
+    intersects = np.all((bucket_maxs >= mins) & (bucket_mins <= maxs), axis=1)
+    bucket_ids = np.flatnonzero(intersects)
+    if len(bucket_ids) == 0:
+        return {
+            "count": 0,
+            "candidate_count": 0,
+            "bucket_count": len(index["buckets"]),
+            "visited_bucket_count": 0,
+        }
+
+    candidate_idxs = np.concatenate([index["buckets"][int(i)] for i in bucket_ids])
+    candidates = points[candidate_idxs]
+    mask = np.all((candidates >= mins) & (candidates <= maxs), axis=1)
+    return {
+        "count": int(np.count_nonzero(mask)),
+        "candidate_count": int(len(candidate_idxs)),
+        "bucket_count": len(index["buckets"]),
+        "visited_bucket_count": int(len(bucket_ids)),
+    }
+
+
+def indexed_range_query(points: np.ndarray, bounds: dict[str, Any], algorithm: str) -> dict[str, Any]:
+    normalized = normalize_range_bounds(bounds)
+    arr = ensure_point_array(points)
+    algo = normalize_spatial_algorithm(algorithm)
+
+    build_started = time.perf_counter()
+    index = build_spatial_range_index(arr, algo)
+    build_ms = (time.perf_counter() - build_started) * 1000.0
+
+    query_started = time.perf_counter()
+    query_result = query_spatial_range_index(index, normalized)
+    query_ms = (time.perf_counter() - query_started) * 1000.0
+
+    return {
+        "algorithm": algo,
+        "count": query_result["count"],
+        "point_count": int(len(arr)),
+        "index_time_ms": round(query_ms, 3),
+        "indexed_time_ms": round(query_ms, 3),
+        "index_build_time_ms": round(build_ms, 3),
+        "bounds": normalized,
+        "candidate_count": query_result["candidate_count"],
+        "bucket_count": query_result["bucket_count"],
+        "visited_bucket_count": query_result["visited_bucket_count"],
+        "index_kind": index["kind"],
+    }
+
+
+def indexed_vs_brute_range_query(points: np.ndarray, bounds: dict[str, Any], algorithm: str) -> dict[str, Any]:
+    indexed = indexed_range_query(points, bounds, algorithm)
+    brute = brute_force_range_query(points, indexed["bounds"])
+    if indexed["count"] != brute["count"]:
+        raise RuntimeError(
+            f"Indexed count mismatch: indexed={indexed['count']} brute={brute['count']}"
+        )
+
+    return {
+        "algorithm": indexed["algorithm"],
+        "count": brute["count"],
+        "indexed_count": indexed["count"],
+        "brute_count": brute["count"],
+        "point_count": brute["point_count"],
+        "index_time_ms": indexed["index_time_ms"],
+        "indexed_time_ms": indexed["indexed_time_ms"],
+        "brute_time_ms": brute["brute_time_ms"],
+        "index_build_time_ms": indexed["index_build_time_ms"],
+        "bounds": indexed["bounds"],
+        "candidate_count": indexed["candidate_count"],
+        "bucket_count": indexed["bucket_count"],
+        "visited_bucket_count": indexed["visited_bucket_count"],
+        "index_kind": indexed["index_kind"],
+        "empty_result": brute["count"] == 0,
+    }
+
+
+def indexed_vs_brute_dataset_range_query(
+    dataset: dict[str, Any],
+    bounds: dict[str, Any],
+    algorithm: str,
+) -> dict[str, Any]:
+    points = load_dataset_points(dataset)
+    result = indexed_vs_brute_range_query(points, bounds, algorithm)
+    dataset_id = dataset.get("_id") or dataset.get("id")
+    result["dataset_id"] = str(dataset_id) if dataset_id is not None else ""
+    result["dataset_name"] = dataset.get("name", "")
+    return result
 
 
 def benchmark_kdtree(points: np.ndarray) -> tuple[Any, Any]:
@@ -635,10 +1226,35 @@ class BenchmarkRunRequest(BaseModel):
     algorithm: str
 
 
-async def require_user(authorization: Optional[str] = Header(default=None)) -> dict[str, Any]:
-    if not authorization or not authorization.lower().startswith("bearer "):
+class SpatialRangeQueryRequest(BaseModel):
+    dataset_id: Optional[str] = None
+    dataset: Optional[str] = None
+    algorithm: str
+    bounds: dict[str, Any]
+
+
+def parse_object_id_or_400(value: str, label: str) -> ObjectId:
+    if not value or not ObjectId.is_valid(value):
+        raise HTTPException(status_code=400, detail=f"Invalid {label} id")
+    return ObjectId(value)
+
+
+def bearer_token_or_401(
+    credentials: Optional[HTTPAuthorizationCredentials],
+) -> str:
+    if (
+        credentials is None
+        or credentials.scheme.lower() != "bearer"
+        or not credentials.credentials
+    ):
         raise HTTPException(status_code=401, detail="Missing bearer token")
-    token = authorization.split(" ", 1)[1]
+    return credentials.credentials
+
+
+async def require_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(bearer_scheme),
+) -> dict[str, Any]:
+    token = bearer_token_or_401(credentials)
     session = await db.sessions.find_one({"token": token})
     if not session:
         raise HTTPException(status_code=401, detail="Invalid token")
@@ -866,8 +1482,11 @@ async def auth_register(payload: AuthRegisterRequest) -> dict[str, Any]:
 
 
 @app.post("/auth/logout")
-async def auth_logout(user: dict[str, Any] = Depends(require_user), authorization: Optional[str] = Header(default=None)) -> dict[str, bool]:
-    token = authorization.split(" ", 1)[1]
+async def auth_logout(
+    user: dict[str, Any] = Depends(require_user),
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(bearer_scheme),
+) -> dict[str, bool]:
+    token = bearer_token_or_401(credentials)
     await db.sessions.delete_many({"token": token})
     return {"ok": True}
 
@@ -950,6 +1569,51 @@ async def benchmarks_run(payload: BenchmarkRunRequest, user: dict[str, Any] = De
 
     final = await db.benchmark_results.find_one({"_id": inserted.inserted_id})
     return oid_str(final)
+
+
+@app.post("/spatial/range-query")
+async def spatial_range_query(payload: SpatialRangeQueryRequest, user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
+    dataset_id = (payload.dataset_id or payload.dataset or "").strip()
+    dataset_oid = parse_object_id_or_400(dataset_id, "dataset")
+    try:
+        algorithm = normalize_spatial_algorithm(payload.algorithm)
+        bounds = normalize_range_bounds(payload.bounds)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    dataset = await db.datasets.find_one({"_id": dataset_oid})
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    index_record = await db.benchmark_results.find_one(
+        {
+            "dataset_id": dataset_id,
+            "algorithm": algorithm,
+            "status": "completed",
+        },
+        sort=[("created_date", -1)],
+    )
+    if not index_record:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Index is not built for dataset {dataset_id} and algorithm {algorithm}",
+        )
+
+    try:
+        result = indexed_vs_brute_dataset_range_query(dataset, bounds, algorithm)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    result["index"] = {
+        "id": str(index_record["_id"]),
+        "algorithm": index_record.get("algorithm", algorithm),
+        "status": index_record.get("status", ""),
+        "created_date": index_record.get("created_date"),
+        "build_time_ms": index_record.get("build_time_ms"),
+    }
+    return result
 
 
 @app.get("/entities/{entity}/list")
