@@ -1914,7 +1914,7 @@ async def files_upload(file: UploadFile = File(...), user: dict[str, Any] = Depe
 async def backup_export(admin: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
     datasets = [oid_str(x) for x in await db.datasets.find({}).to_list(length=100000)]
     benchmarks = [oid_str(x) for x in await db.benchmark_results.find({}).to_list(length=100000)]
-    users = [oid_str(x) for x in await db.users.find({}, {"password_hash": 0}).to_list(length=100000)]
+    users = [oid_str(x) for x in await db.users.find({"role": {"$ne": "admin"}}, {"password_hash": 0}).to_list(length=100000)]
     events = [oid_str(x) for x in await db.benchmark_status_events.find({}).to_list(length=100000)]
     return {
         "exported_at": now_iso(),
@@ -1936,11 +1936,14 @@ async def backup_import_replace(payload: ReplaceImportRequest, admin: dict[str, 
     users = entities.get("users", [])
     events = entities.get("benchmark_status_events", [])
 
+    existing_admins = await db.users.find({"role": "admin"}).to_list(length=1000)
+    admin_ids = [str(user["_id"]) for user in existing_admins]
+
     await db.datasets.delete_many({})
     await db.benchmark_results.delete_many({})
     await db.benchmark_status_events.delete_many({})
-    await db.sessions.delete_many({})
-    await db.users.delete_many({})
+    await db.sessions.delete_many({"user_id": {"$nin": admin_ids}})
+    await db.users.delete_many({"role": {"$ne": "admin"}})
 
     def strip_ids(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         cleaned = []
@@ -1956,10 +1959,13 @@ async def backup_import_replace(payload: ReplaceImportRequest, admin: dict[str, 
     if users:
         to_insert = []
         for u in strip_ids(users):
+            if u.get("role") == "admin":
+                continue
             if "password_hash" not in u:
                 u["password_hash"] = hash_password("changeme123")
             to_insert.append(u)
-        await db.users.insert_many(to_insert)
+        if to_insert:
+            await db.users.insert_many(to_insert)
     if datasets:
         dataset_rows = []
         old_dataset_ids = []
