@@ -3,24 +3,26 @@
 ## Инструкция по запуску локально
 
 1. Создать виртуальное окружение и установить зависимости
+
 ```
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-2. Указать URL MongoDB в `MONGO_URL` (по умолчанию `mongodb://localhost:27017`).
+1. Указать URL MongoDB в `MONGO_URL` (по умолчанию `mongodb://localhost:27017`).
 
-3. Запустить сервер
+2. Запустить сервер
+
 ```
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-4. Запустить backend-тесты
+1. Запустить backend-тесты
+
 ```
 python -m unittest discover -s tests
 ```
-
 
 ## Основные API ручки
 
@@ -39,10 +41,43 @@ python -m unittest discover -s tests
 - `POST /benchmarks/run`
 - `POST /spatial/range-query`
 - `POST /files/upload`
+- `GET /datasets/{dataset_id}/export`
 - `POST /backup/export`
 - `POST /backup/import-replace`
 
 Где `Entity` из: `Dataset`, `BenchmarkResult`, `BenchmarkResultStatusEvent`, `User`.
+
+## CSV датасеты
+
+`POST /files/upload` принимает CSV-файл с точками. Другие форматы для загрузки
+через эту ручку не поддерживаются.
+
+Файл должен содержать координаты точек `x`, `y`, `z` в формате, который умеет
+читать backend-загрузчик точек. При успешной загрузке backend сохраняет файл,
+валидирует его и возвращает ссылку на файл и количество точек:
+
+```json
+{
+  "file_url": "/files/0f4f8c8d7d43c8f4_cloud.csv",
+  "point_count": 10000
+}
+```
+
+После загрузки файл можно привязать к датасету через `POST /entities/Dataset`,
+указав `source: "uploaded"`, `file_url`, `file_name` и `point_count`.
+
+`GET /datasets/{dataset_id}/export` экспортирует датасет в CSV с колонками
+`x`, `y`, `z`. Для обычного пользователя доступны только свои или публичные
+датасеты, администратор может экспортировать любой датасет.
+
+## Backup
+
+`POST /backup/export` экспортирует данные проекта в JSON, но не включает
+admin-пользователей и их `password_hash`.
+
+`POST /backup/import-replace` заменяет данные проекта из backup-JSON, сохраняя
+существующих admin-пользователей и их сессии. Это нужно, чтобы после
+восстановления backup текущий администратор не терял авторизацию.
 
 ## Seed учеток по умолчанию
 

@@ -1,6 +1,6 @@
 # nosql_template
 
-## Прототип 0.5: Хранение и представление
+## Прототип 0.8: Анализ
 
 Актуальное приложение (backend + frontend) в каталоге [`service/`](service/). Корневой `docker compose` собирает образы из `service/backend` и `service/frontend`.
 
@@ -33,6 +33,10 @@ docker compose up
 - Полный экспорт данных
 - Полный импорт данных в режиме **replace** (очистка и загрузка)
 - Авторизация через login/password (backend API), роли `admin`/`user`
+- Загрузка CSV-датасетов с валидацией точек и экспорт отдельного датасета в CSV
+- Запуск benchmark для пространственных структур с реальными измерениями времени построения, памяти и точности
+- Backend-поддержка алгоритмов `kdtree`, `octree`, `balltree`, `rtree`, `bvh`, `svo`, `phtree`, `morton`, `hilbert`
+- Пространственный поиск по 3D-диапазону: backend-сравнение indexed query с brute-force и отображение результата во frontend
 
 
 ## Предварительная проверка заданий
