@@ -1,3 +1,4 @@
+import csv
 import hashlib
 import json
 import logging
@@ -8,13 +9,14 @@ import secrets
 import time
 import tracemalloc
 from datetime import datetime, timezone
+from io import StringIO
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import unquote, urlparse
 
 import numpy as np
 from bson import ObjectId
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Security, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Response, Security, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
@@ -519,6 +521,32 @@ def load_dataset_points(dataset: dict[str, Any]) -> np.ndarray:
     if source == "uploaded":
         return load_uploaded_dataset_points(dataset)
     return generate_dataset_points(dataset, min_points=0, max_points=None)
+
+
+def _sanitize_csv_filename(name: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", name or "")
+    sanitized = sanitized.strip("_")
+    return sanitized or "dataset"
+
+
+async def _save_uploaded_csv_file(file: UploadFile) -> tuple[Path, str]:
+    original_name = Path(file.filename or "").name
+    if not original_name.lower().endswith(".csv"):
+        raise ValueError("Only .csv files are supported for upload")
+    unique_name = f"{secrets.token_hex(8)}_{original_name}"
+    path = (UPLOAD_DIR / unique_name).resolve()
+    if path.parent != UPLOAD_DIR.resolve():
+        raise ValueError("Invalid file upload path")
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    content = await file.read()
+    with path.open("wb") as handle:
+        handle.write(content)
+    return path, unique_name
+
+
+def _validate_csv_file(path: Path) -> int:
+    points = _load_delimited_points(path)
+    return int(points.shape[0])
 
 
 def normalize_range_bounds(bounds: dict[str, Any]) -> dict[str, float]:
@@ -1762,6 +1790,61 @@ async def datasets_query(payload: DatasetQueryBody, user: dict[str, Any] = Depen
     return {"items": [oid_str(x) for x in items_raw], "total": total}
 
 
+@app.post("/files/upload")
+async def files_upload(file: UploadFile = File(...), user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
+    if not file.filename or not Path(file.filename).suffix.lower() == ".csv":
+        raise HTTPException(status_code=400, detail="Only .csv files are supported for upload")
+
+    try:
+        path, saved_name = await _save_uploaded_csv_file(file)
+        point_count = _validate_csv_file(path)
+    except ValueError as exc:
+        if "path" in locals() and path.exists():
+            path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        if "path" in locals() and path.exists():
+            path.unlink(missing_ok=True)
+        raise
+
+    return {
+        "file_url": f"/files/{saved_name}",
+        "point_count": point_count,
+    }
+
+
+@app.get("/datasets/{dataset_id}/export")
+async def export_dataset_csv(dataset_id: str, user: dict[str, Any] = Depends(require_user)) -> Response:
+    if not ObjectId.is_valid(dataset_id):
+        raise HTTPException(status_code=400, detail="Invalid dataset id")
+
+    doc = await db.datasets.find_one({"_id": ObjectId(dataset_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    dataset = oid_str(doc)
+    if user.get("role") != "admin" and dataset.get("created_by") != user.get("email") and not dataset.get("is_public"):
+        raise HTTPException(status_code=403, detail="Not allowed to export this dataset")
+
+    try:
+        points = load_dataset_points(dataset)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["x", "y", "z"])
+    for row in points:
+        writer.writerow([row[0], row[1], row[2]])
+
+    filename = f"{_sanitize_csv_filename(dataset.get('name') or dataset.get('id'))}.csv"
+    return Response(
+        output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.get("/entities/{entity}/{record_id}")
 async def entity_get(entity: str, record_id: str, user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
     mapping = {
@@ -1900,22 +1983,13 @@ async def users_invite(payload: InviteRequest, admin: dict[str, Any] = Depends(r
     return oid_str(await db.users.find_one({"_id": inserted.inserted_id}))
 
 
-@app.post("/files/upload")
-async def files_upload(file: UploadFile = File(...), user: dict[str, Any] = Depends(require_user)) -> dict[str, str]:
-    ext = Path(file.filename).suffix
-    safe_name = f"{secrets.token_hex(8)}{ext}"
-    target = UPLOAD_DIR / safe_name
-    content = await file.read()
-    target.write_bytes(content)
-    return {"file_url": f"/files/{safe_name}"}
-
-
 @app.post("/backup/export")
-async def backup_export(admin: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+async def backup_export(format: Optional[str] = Query(default="json"), admin: dict[str, Any] = Depends(require_admin)) -> Any:
     datasets = [oid_str(x) for x in await db.datasets.find({}).to_list(length=100000)]
     benchmarks = [oid_str(x) for x in await db.benchmark_results.find({}).to_list(length=100000)]
-    users = [oid_str(x) for x in await db.users.find({}, {"password_hash": 0}).to_list(length=100000)]
+    users = [oid_str(x) for x in await db.users.find({"role": {"$ne": "admin"}}, {"password_hash": 0}).to_list(length=100000)]
     events = [oid_str(x) for x in await db.benchmark_status_events.find({}).to_list(length=100000)]
+
     return {
         "exported_at": now_iso(),
         "version": "1.0",
@@ -1936,11 +2010,14 @@ async def backup_import_replace(payload: ReplaceImportRequest, admin: dict[str, 
     users = entities.get("users", [])
     events = entities.get("benchmark_status_events", [])
 
+    existing_admins = await db.users.find({"role": "admin"}).to_list(length=1000)
+    admin_ids = [str(user["_id"]) for user in existing_admins]
+
     await db.datasets.delete_many({})
     await db.benchmark_results.delete_many({})
     await db.benchmark_status_events.delete_many({})
-    await db.sessions.delete_many({})
-    await db.users.delete_many({})
+    await db.sessions.delete_many({"user_id": {"$nin": admin_ids}})
+    await db.users.delete_many({"role": {"$ne": "admin"}})
 
     def strip_ids(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         cleaned = []
@@ -1956,10 +2033,13 @@ async def backup_import_replace(payload: ReplaceImportRequest, admin: dict[str, 
     if users:
         to_insert = []
         for u in strip_ids(users):
+            if u.get("role") == "admin":
+                continue
             if "password_hash" not in u:
                 u["password_hash"] = hash_password("changeme123")
             to_insert.append(u)
-        await db.users.insert_many(to_insert)
+        if to_insert:
+            await db.users.insert_many(to_insert)
     if datasets:
         dataset_rows = []
         old_dataset_ids = []

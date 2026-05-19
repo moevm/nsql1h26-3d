@@ -31,6 +31,26 @@ async function api(path, { method = "GET", body, isForm = false } = {}) {
   return response.json();
 }
 
+async function apiBlob(path, { method = "GET", body, isForm = false } = {}) {
+  const token = getToken();
+  const headers = {};
+  if (!isForm) headers["Content-Type"] = "application/json";
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  const response = await fetch(`${API_BASE}${path}`, {
+    method,
+    headers,
+    body: body == null ? undefined : isForm ? body : JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    const error = new Error(text || "API error");
+    error.status = response.status;
+    throw error;
+  }
+  return response.blob();
+}
+
 function entityApi(name) {
   return {
     list: (orderBy, limit) =>
@@ -114,6 +134,7 @@ export const pointCloud = {
   },
   datasets: {
     query: (body) => api("/datasets/query", { method: "POST", body }),
+    exportCsv: (id) => apiBlob(`/datasets/${encodeURIComponent(id)}/export`),
   },
   entities: {
     Dataset: entityApi("Dataset"),
