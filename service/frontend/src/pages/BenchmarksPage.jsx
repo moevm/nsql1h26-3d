@@ -4,6 +4,8 @@ import { pointCloud } from "@/api/pointCloudClient";
 import { RefreshCw, Search } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
 
+const KNOWN_ALGORITHMS = ["kdtree", "octree", "balltree", "rtree", "svo", "phtree", "morton", "hilbert", "bvh"];
+
 const STATUS_COLORS = {
   completed: "bg-lime/10 text-lime border-lime/20",
   processing: "bg-yellow-400/10 text-yellow-400 border-yellow-400/20",
@@ -19,9 +21,10 @@ const SORT_OPTIONS = [
 ];
 const PAGE_SIZE = 20;
 
-export default function BenchmarksPage({ user, initialDataset, initialBenchmarkId, onBackToList }) {
+export default function BenchmarksPage({ user, initialDataset: _initialDataset, initialBenchmarkId, onBackToList }) {
   const navigate = useNavigate();
   const [results, setResults] = useState([]);
+  const [totalFiltered, setTotalFiltered] = useState(0);
   const [loading, setLoading] = useState(true);
   const [datasetQuery, setDatasetQuery] = useState("");
   const [filterAlgorithm, setFilterAlgorithm] = useState("");
@@ -41,17 +44,31 @@ export default function BenchmarksPage({ user, initialDataset, initialBenchmarkI
   const [historySearchLoading, setHistorySearchLoading] = useState(false);
   const [historySearchDone, setHistorySearchDone] = useState(false);
 
-  const load = async () => {
+  const load = useCallback(async () => {
+    if (!user) return;
     setLoading(true);
-    const filter = user?.role === "admin" ? {} : { created_by: user?.email };
-    const data = await pointCloud.entities.BenchmarkResult.filter(filter, "-created_date", 500);
-    const byId = new Map();
-    data.forEach((r) => byId.set(r.id, r));
-    setResults(Array.from(byId.values()));
-    setLoading(false);
-  };
+    try {
+      const filter = user.role === "admin" ? {} : { created_by: user.email };
+      if (datasetQuery.trim()) filter.dataset_name_contains = datasetQuery.trim();
+      if (filterAlgorithm) filter.algorithm = filterAlgorithm;
+      if (filterStatus) filter.status = filterStatus;
+      const res = await pointCloud.entities.BenchmarkResult.filter(
+        filter,
+        sortBy,
+        PAGE_SIZE,
+        (page - 1) * PAGE_SIZE,
+        { countTotal: true }
+      );
+      setResults(res.items ?? []);
+      setTotalFiltered(typeof res.total === "number" ? res.total : (res.items?.length ?? 0));
+    } finally {
+      setLoading(false);
+    }
+  }, [user, datasetQuery, filterAlgorithm, filterStatus, sortBy, page]);
 
-  useEffect(() => { if (user) load(); }, [user]);
+  useEffect(() => {
+    if (user) load();
+  }, [user, load]);
 
   useEffect(() => {
     if (!initialBenchmarkId || !pointCloud.entities.BenchmarkResult.get) return;
@@ -60,31 +77,6 @@ export default function BenchmarksPage({ user, initialDataset, initialBenchmarkI
     });
   }, [initialBenchmarkId]);
 
-  const filteredAndSorted = useMemo(() => {
-    let list = [...results];
-    const q = datasetQuery.trim().toLowerCase();
-    if (q) {
-      list = list.filter(r => (r.dataset_name || "").toLowerCase().includes(q));
-    }
-    if (filterAlgorithm) list = list.filter(r => (r.algorithm || "").toLowerCase() === filterAlgorithm.toLowerCase());
-    if (filterStatus) list = list.filter(r => (r.status || "").toLowerCase() === filterStatus.toLowerCase());
-    const desc = sortBy.startsWith("-");
-    const key = desc ? sortBy.slice(1) : sortBy;
-    list.sort((a, b) => {
-      const va = a[key] ?? (key === "build_time_ms" ? 0 : "");
-      const vb = b[key] ?? (key === "build_time_ms" ? 0 : "");
-      if (typeof va === "number" && typeof vb === "number") return desc ? vb - va : va - vb;
-      if (typeof va === "string" && typeof vb === "string") return desc ? vb.localeCompare(va) : va.localeCompare(vb);
-      return 0;
-    });
-    return list;
-  }, [results, datasetQuery, filterAlgorithm, filterStatus, sortBy]);
-
-  const totalFiltered = filteredAndSorted.length;
-  const paginated = useMemo(() => {
-    const start = (page - 1) * PAGE_SIZE;
-    return filteredAndSorted.slice(start, start + PAGE_SIZE);
-  }, [filteredAndSorted, page]);
   const totalPages = Math.max(1, Math.ceil(totalFiltered / PAGE_SIZE));
 
   useEffect(() => {
@@ -117,21 +109,13 @@ export default function BenchmarksPage({ user, initialDataset, initialBenchmarkI
     if (!pointCloud.entities.BenchmarkResultStatusEvent) return;
     setHistorySearchLoading(true);
     setHistorySearchDone(false);
-    const filter = historyToStatus ? { to_status: historyToStatus } : {};
+    const filter = {};
+    if (historyToStatus) filter.to_status = historyToStatus;
+    if (historyDateFrom) filter.created_date_from = new Date(`${historyDateFrom}T00:00:00.000Z`).toISOString();
+    if (historyDateTo) filter.created_date_to = new Date(`${historyDateTo}T23:59:59.999Z`).toISOString();
     pointCloud.entities.BenchmarkResultStatusEvent
       .filter(filter, "-created_date", 300)
-      .then((events) => {
-        let list = events;
-        if (historyDateFrom) {
-          const from = new Date(historyDateFrom).getTime();
-          list = list.filter((e) => new Date(e.created_date).getTime() >= from);
-        }
-        if (historyDateTo) {
-          const to = new Date(historyDateTo).getTime() + 86400000;
-          list = list.filter((e) => new Date(e.created_date).getTime() < to);
-        }
-        setHistoryEvents(list);
-      })
+      .then(setHistoryEvents)
       .catch(() => setHistoryEvents([]))
       .finally(() => {
         setHistorySearchLoading(false);
@@ -152,7 +136,11 @@ export default function BenchmarksPage({ user, initialDataset, initialBenchmarkI
     [r.algorithm]: r.build_time_ms,
   }));
   const usedAlgos = [...new Set(completed.map(r => r.algorithm))];
-  const algorithms = [...new Set(results.map(r => r.algorithm).filter(Boolean))];
+  const algorithms = useMemo(() => {
+    const fromPage = new Set(results.map(r => r.algorithm).filter(Boolean));
+    KNOWN_ALGORITHMS.forEach((a) => fromPage.add(a));
+    return [...fromPage].sort();
+  }, [results]);
 
   if (selectedResult) {
     return (
@@ -182,6 +170,9 @@ export default function BenchmarksPage({ user, initialDataset, initialBenchmarkI
             <div><span className="text-[10px] text-muted-foreground uppercase">Accuracy</span><p className="font-mono text-lime">{selectedResult.accuracy_pct != null ? `${selectedResult.accuracy_pct}%` : "—"}</p></div>
             <div><span className="text-[10px] text-muted-foreground uppercase">Points</span><p className="font-mono">{selectedResult.point_count != null ? selectedResult.point_count.toLocaleString() : "—"}</p></div>
           </div>
+          {user?.role === "admin" && selectedResult.created_by && (
+            <p className="text-[10px] font-mono text-muted-foreground">Run by: <span className="text-foreground">{selectedResult.created_by}</span></p>
+          )}
           <div className="text-[10px] font-mono text-muted-foreground space-y-0.5">
             <p>Created: {selectedResult.created_date ? new Date(selectedResult.created_date).toLocaleString() : "—"}</p>
             <p>Updated: {selectedResult.updated_date ? new Date(selectedResult.updated_date).toLocaleString() : (selectedResult.created_date ? new Date(selectedResult.created_date).toLocaleString() : "—")}</p>
@@ -365,14 +356,15 @@ export default function BenchmarksPage({ user, initialDataset, initialBenchmarkI
       <>
       <div className="grid grid-cols-4 gap-3">
         {[
-          { label: "Total Runs", value: results.length, color: "text-cyan" },
-          { label: "Completed", value: results.filter(r => r.status === "completed").length, color: "text-lime" },
-          { label: "Processing", value: results.filter(r => r.status === "processing").length, color: "text-yellow-400" },
-          { label: "Failed", value: results.filter(r => r.status === "failed").length, color: "text-destructive" },
-        ].map(({ label, value, color }) => (
+          { label: "Matching runs", value: totalFiltered, color: "text-cyan", sub: "по фильтрам на сервере" },
+          { label: "Completed (page)", value: results.filter(r => r.status === "completed").length, color: "text-lime", sub: "текущая страница" },
+          { label: "Processing (page)", value: results.filter(r => r.status === "processing").length, color: "text-yellow-400", sub: "текущая страница" },
+          { label: "Failed (page)", value: results.filter(r => r.status === "failed").length, color: "text-destructive", sub: "текущая страница" },
+        ].map(({ label, value, color, sub }) => (
           <div key={label} className="bg-card border border-border rounded-lg px-4 py-3">
             <p className="text-[10px] text-muted-foreground font-mono uppercase tracking-wider">{label}</p>
             <p className={`text-2xl font-bold ${color}`}>{value}</p>
+            {sub && <p className="text-[9px] text-muted-foreground mt-0.5">{sub}</p>}
           </div>
         ))}
       </div>
@@ -408,29 +400,30 @@ export default function BenchmarksPage({ user, initialDataset, initialBenchmarkI
             <table className="w-full text-xs">
               <thead>
                 <tr className="border-b border-border">
-                  {["Algorithm", "Dataset", "Build Time", "Memory", "Accuracy", "Status"].map(col => (
+                  {(user?.role === "admin"
+                    ? ["Algorithm", "Dataset", "Run by", "Build Time", "Memory", "Accuracy", "Status"]
+                    : ["Algorithm", "Dataset", "Build Time", "Memory", "Accuracy", "Status"]
+                  ).map(col => (
                     <th key={col} className="px-4 py-2.5 text-left font-mono text-[10px] text-muted-foreground uppercase tracking-wider whitespace-nowrap">{col}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {paginated.length === 0 ? (
-                  <tr><td colSpan={6} className="px-4 py-8 text-center text-muted-foreground">No results match filters.</td></tr>
+                {results.length === 0 ? (
+                  <tr><td colSpan={user?.role === "admin" ? 7 : 6} className="px-4 py-8 text-center text-muted-foreground">No results match filters.</td></tr>
                 ) : (
-                  paginated.map((r, idx) => (
+                  results.map((r, idx) => (
                     <tr
                       key={`${r.id}-${idx}`}
                       data-result-id={r.id}
-                      onClick={(e) => {
-                        const row = e.currentTarget;
-                        const id = row.getAttribute("data-result-id");
-                        const result = results.find((x) => x.id === id);
-                        if (result) navigate(`/benchmark/${result.id}`);
-                      }}
+                      onClick={() => navigate(`/benchmark/${r.id}`)}
                       className="border-b border-border/50 hover:bg-secondary/50 transition-colors cursor-pointer"
                     >
                       <td className="px-4 py-3 font-medium text-foreground">{(r.algorithm || "").toUpperCase()}</td>
                       <td className="px-4 py-3 text-muted-foreground truncate max-w-[120px]" title={r.dataset_name}>{r.dataset_name || "—"}</td>
+                      {user?.role === "admin" && (
+                        <td className="px-4 py-3 font-mono text-[10px] text-muted-foreground truncate max-w-[100px]" title={r.created_by}>{r.created_by || "—"}</td>
+                      )}
                       <td className="px-4 py-3 font-mono text-cyan">{r.build_time_ms != null ? `${r.build_time_ms} ms` : "—"}</td>
                       <td className="px-4 py-3 font-mono text-muted-foreground">{r.memory_mb != null ? `${r.memory_mb} MB` : "—"}</td>
                       <td className="px-4 py-3 font-mono text-lime">{r.accuracy_pct != null ? `${r.accuracy_pct}%` : "—"}</td>

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { Link } from "react-router-dom";
 import { pointCloud } from "@/api/pointCloudClient";
 import { Plus, Trash2, RefreshCw, FlaskConical, Search, LayoutGrid, List } from "lucide-react";
@@ -32,8 +32,9 @@ const SORT_OPTIONS = [
 
 const PAGE_SIZE = 20;
 
-export default function DatasetsPage({ user, onNavigateToBenchmark, onNavigateToVisualize, onNavigateToDataset }) {
+export default function DatasetsPage({ user, onNavigateToBenchmark, onNavigateToVisualize: _v, onNavigateToDataset: _d }) {
   const [datasets, setDatasets] = useState([]);
+  const [totalFiltered, setTotalFiltered] = useState(0);
   const [loading, setLoading] = useState(true);
   const [showPicker, setShowPicker] = useState(false);
   const [lastBenchmarkByDataset, setLastBenchmarkByDataset] = useState({});
@@ -43,96 +44,92 @@ export default function DatasetsPage({ user, onNavigateToBenchmark, onNavigateTo
   const [filterSource, setFilterSource] = useState("");
   const [sortBy, setSortBy] = useState("-created_date");
   const [page, setPage] = useState(1);
-  const [benchmarkResultsForCross, setBenchmarkResultsForCross] = useState([]);
   const [crossMinRuns, setCrossMinRuns] = useState("");
   const [crossMaxRuns, setCrossMaxRuns] = useState("");
   const [crossStatus, setCrossStatus] = useState("");
-  const [listView, setListView] = useState("cards"); // "cards" | "table"
+  const [listView, setListView] = useState("cards");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [pointMin, setPointMin] = useState("");
+  const [pointMax, setPointMax] = useState("");
 
-  const load = async () => {
+  const load = useCallback(async () => {
+    if (!user) return;
     setLoading(true);
-    const filter = user?.role === "admin" ? {} : { created_by: user?.email };
-    const data = await pointCloud.entities.Dataset.filter(filter, "-created_date", 500);
-    setDatasets(data);
-    setLoading(false);
-  };
+    const baseFilter = {};
+    if (nameQuery.trim()) baseFilter.name_contains = nameQuery.trim();
+    if (descriptionQuery.trim()) baseFilter.description_contains = descriptionQuery.trim();
+    if (filterSource) baseFilter.source = filterSource;
+    if (dateFrom) baseFilter.created_date_from = new Date(`${dateFrom}T00:00:00.000Z`).toISOString();
+    if (dateTo) baseFilter.created_date_to = new Date(`${dateTo}T23:59:59.999Z`).toISOString();
+    if (pointMin !== "" && !Number.isNaN(Number(pointMin))) baseFilter.point_count_min = Number(pointMin);
+    if (pointMax !== "" && !Number.isNaN(Number(pointMax))) baseFilter.point_count_max = Number(pointMax);
 
-  useEffect(() => { if (user) load(); }, [user]);
+    const runCountMin = crossMinRuns === "" ? null : parseInt(crossMinRuns, 10);
+    const runCountMax = crossMaxRuns === "" ? null : parseInt(crossMaxRuns, 10);
+    const runBucket = crossStatus || "all";
+
+    try {
+      const res = await pointCloud.datasets.query({
+        filter: baseFilter,
+        order_by: sortBy,
+        skip: (page - 1) * PAGE_SIZE,
+        limit: PAGE_SIZE,
+        run_status_bucket: runBucket,
+        run_count_min: runCountMin != null && !Number.isNaN(runCountMin) ? runCountMin : null,
+        run_count_max: runCountMax != null && !Number.isNaN(runCountMax) ? runCountMax : null,
+      });
+      setDatasets(res.items ?? []);
+      setTotalFiltered(res.total ?? 0);
+    } finally {
+      setLoading(false);
+    }
+  }, [
+    user,
+    nameQuery,
+    descriptionQuery,
+    filterSource,
+    sortBy,
+    page,
+    dateFrom,
+    dateTo,
+    pointMin,
+    pointMax,
+    crossMinRuns,
+    crossMaxRuns,
+    crossStatus,
+  ]);
 
   useEffect(() => {
-    if (!user) return;
+    if (user) load();
+  }, [user, load]);
+
+  useEffect(() => {
+    if (!user || datasets.length === 0) {
+      setLastBenchmarkByDataset({});
+      return;
+    }
+    const idSet = new Set(datasets.map((d) => d.id));
     const filter = user?.role === "admin" ? {} : { created_by: user?.email };
-    pointCloud.entities.BenchmarkResult.filter(filter, "-created_date", 500).then(results => {
+    pointCloud.entities.BenchmarkResult.filter(filter, "-created_date", 1000).then((results) => {
       const byDs = {};
-      results.forEach(r => {
-        if (r.dataset_id && (!byDs[r.dataset_id] || (r.created_date && r.created_date > byDs[r.dataset_id])))
+      results.forEach((r) => {
+        if (!r.dataset_id || !idSet.has(r.dataset_id)) return;
+        if (!byDs[r.dataset_id] || (r.created_date && r.created_date > byDs[r.dataset_id]))
           byDs[r.dataset_id] = r.created_date;
       });
       setLastBenchmarkByDataset(byDs);
-      setBenchmarkResultsForCross(results);
     });
-  }, [user]);
+  }, [user, datasets]);
 
-  const datasetRunCounts = useMemo(() => {
-    const counts = {};
-    benchmarkResultsForCross.forEach(r => {
-      if (!r.dataset_id) return;
-      if (!counts[r.dataset_id]) counts[r.dataset_id] = { processing: 0, failed: 0, queued: 0, completed: 0 };
-      const s = (r.status || "").toLowerCase();
-      if (s in counts[r.dataset_id]) counts[r.dataset_id][s]++;
-    });
-    return counts;
-  }, [benchmarkResultsForCross]);
-
-  const filteredAndSorted = useMemo(() => {
-    let list = [...datasets];
-    const nameQ = nameQuery.trim().toLowerCase();
-    const descQ = descriptionQuery.trim().toLowerCase();
-    if (nameQ) {
-      list = list.filter(d => (d.name || "").toLowerCase().includes(nameQ));
-    }
-    if (descQ) {
-      list = list.filter(d => (d.description || "").toLowerCase().includes(descQ));
-    }
-    if (filterSource) list = list.filter(d => (d.source || "") === filterSource);
-    const minR = crossMinRuns === "" ? null : parseInt(crossMinRuns, 10);
-    const maxR = crossMaxRuns === "" ? null : parseInt(crossMaxRuns, 10);
-    if ((minR != null && !isNaN(minR)) || (maxR != null && !isNaN(maxR))) {
-      const minVal = minR != null && !isNaN(minR) ? minR : 0;
-      const maxVal = maxR != null && !isNaN(maxR) ? maxR : Infinity;
-      if (crossStatus) {
-        list = list.filter(d => {
-          const c = datasetRunCounts[d.id];
-          if (!c) return false;
-          const n = crossStatus === "unfinished"
-            ? (c.processing || 0) + (c.failed || 0) + (c.queued || 0)
-            : (c[crossStatus] || 0);
-          return n >= minVal && n <= maxVal;
-        });
-      }
-    }
-    const desc = sortBy.startsWith("-");
-    const key = desc ? sortBy.slice(1) : sortBy;
-    list.sort((a, b) => {
-      const va = a[key] ?? "";
-      const vb = b[key] ?? "";
-      if (typeof va === "string" && typeof vb === "string") return desc ? vb.localeCompare(va) : va.localeCompare(vb);
-      return desc ? (vb > va ? 1 : vb < va ? -1 : 0) : (va > vb ? 1 : va < vb ? -1 : 0);
-    });
-    return list;
-  }, [datasets, nameQuery, descriptionQuery, filterSource, sortBy, crossMinRuns, crossMaxRuns, crossStatus, datasetRunCounts]);
-
-  const totalFiltered = filteredAndSorted.length;
-  const paginated = useMemo(() => {
-    const start = (page - 1) * PAGE_SIZE;
-    return filteredAndSorted.slice(start, start + PAGE_SIZE);
-  }, [filteredAndSorted, page]);
   const totalPages = Math.max(1, Math.ceil(totalFiltered / PAGE_SIZE));
 
   const handleDelete = async (id) => {
     await pointCloud.entities.Dataset.delete(id);
-    setDatasets(prev => prev.filter(d => d.id !== id));
+    await load();
   };
+
+  const showFilters = !loading || totalFiltered > 0 || nameQuery || descriptionQuery || filterSource;
 
   return (
     <div className="p-6 space-y-6">
@@ -183,7 +180,7 @@ export default function DatasetsPage({ user, onNavigateToBenchmark, onNavigateTo
         </div>
       </div>
 
-      {!loading && datasets.length > 0 && (
+      {showFilters && (
         <div className="flex flex-wrap items-center gap-2">
           <div className="relative min-w-[180px] max-w-xs">
             <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
@@ -215,6 +212,42 @@ export default function DatasetsPage({ user, onNavigateToBenchmark, onNavigateTo
               <option key={val} value={val}>{label}</option>
             ))}
           </select>
+          <div className="flex items-center gap-1 border-l border-border pl-2">
+            <span className="text-[10px] text-muted-foreground whitespace-nowrap">Added from</span>
+            <input
+              type="date"
+              value={dateFrom}
+              onChange={e => { setDateFrom(e.target.value); setPage(1); }}
+              className="bg-secondary border border-border rounded-md px-2 py-1.5 text-xs text-foreground max-w-[140px]"
+            />
+            <span className="text-[10px] text-muted-foreground">to</span>
+            <input
+              type="date"
+              value={dateTo}
+              onChange={e => { setDateTo(e.target.value); setPage(1); }}
+              className="bg-secondary border border-border rounded-md px-2 py-1.5 text-xs text-foreground max-w-[140px]"
+            />
+          </div>
+          <div className="flex items-center gap-1">
+            <span className="text-[10px] text-muted-foreground whitespace-nowrap">Points</span>
+            <input
+              type="number"
+              min={0}
+              value={pointMin}
+              onChange={e => { setPointMin(e.target.value); setPage(1); }}
+              placeholder="min"
+              className="w-20 bg-secondary border border-border rounded-md px-2 py-1.5 text-xs"
+            />
+            <span className="text-[10px] text-muted-foreground">–</span>
+            <input
+              type="number"
+              min={0}
+              value={pointMax}
+              onChange={e => { setPointMax(e.target.value); setPage(1); }}
+              placeholder="max"
+              className="w-20 bg-secondary border border-border rounded-md px-2 py-1.5 text-xs"
+            />
+          </div>
           <select
             value={sortBy}
             onChange={e => { setSortBy(e.target.value); setPage(1); }}
@@ -224,8 +257,13 @@ export default function DatasetsPage({ user, onNavigateToBenchmark, onNavigateTo
               <option key={o.value} value={o.value}>{o.label}</option>
             ))}
           </select>
-          <div className="flex items-center gap-1.5 border-l border-border pl-2">
-            <span className="text-[10px] text-muted-foreground whitespace-nowrap">Runs from</span>
+          <div
+            className="flex flex-wrap items-center gap-1.5 border-l border-border pl-2 max-w-xl"
+            title="Фильтр по числу записей BenchmarkResult для датасета. Выберите, какие статусы учитывать (или все), затем диапазон количества таких запусков."
+          >
+            <span className="text-[10px] text-muted-foreground whitespace-nowrap">
+              Benchmark runs (по статусу ниже): от
+            </span>
             <input
               type="number"
               min={0}
@@ -234,26 +272,26 @@ export default function DatasetsPage({ user, onNavigateToBenchmark, onNavigateTo
               className="w-14 bg-secondary border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:outline-none focus:border-primary/50"
               placeholder="0"
             />
-            <span className="text-[10px] text-muted-foreground whitespace-nowrap">to</span>
+            <span className="text-[10px] text-muted-foreground whitespace-nowrap">до</span>
             <input
               type="number"
               min={0}
               value={crossMaxRuns}
-              onChange={e => { setCrossMaxRuns(e.target.value); setPage(1); }}
+              onChange={e => { const v = e.target.value; setCrossMaxRuns(v); setPage(1); }}
               className="w-14 bg-secondary border border-border rounded-md px-2 py-1.5 text-xs text-foreground focus:outline-none focus:border-primary/50"
-              placeholder="—"
+              placeholder="∞"
             />
             <select
               value={crossStatus}
               onChange={e => { setCrossStatus(e.target.value); setPage(1); }}
-              className="bg-secondary border border-border rounded-md px-3 py-1.5 text-xs text-foreground focus:outline-none focus:border-primary/50"
+              className="bg-secondary border border-border rounded-md px-3 py-1.5 text-xs text-foreground focus:outline-none focus:border-primary/50 min-w-[140px]"
             >
-              <option value="">—</option>
-              <option value="unfinished">Any non-completed</option>
-              <option value="processing">Processing</option>
-              <option value="failed">Failed</option>
-              <option value="queued">Queued</option>
-              <option value="completed">Completed</option>
+              <option value="">Все статусы</option>
+              <option value="unfinished">Любые не completed</option>
+              <option value="processing">processing</option>
+              <option value="failed">failed</option>
+              <option value="queued">queued</option>
+              <option value="completed">completed</option>
             </select>
           </div>
         </div>
@@ -263,14 +301,12 @@ export default function DatasetsPage({ user, onNavigateToBenchmark, onNavigateTo
         <div className="grid grid-cols-3 gap-3">
           {[1,2,3].map(i => <div key={i} className="h-24 rounded-lg bg-card border border-border animate-pulse" />)}
         </div>
-      ) : datasets.length === 0 ? (
-        <div className="text-center py-16 space-y-3">
-          <span className="text-4xl">📂</span>
-          <p className="text-sm text-muted-foreground">No datasets yet. Create one above.</p>
-        </div>
       ) : totalFiltered === 0 ? (
         <div className="text-center py-16 space-y-3">
-          <p className="text-sm text-muted-foreground">No datasets match current filters.</p>
+          <span className="text-4xl">📂</span>
+          <p className="text-sm text-muted-foreground">
+            {datasets.length === 0 && !nameQuery && !descriptionQuery && !filterSource ? "No datasets yet. Create one above." : "No datasets match current filters."}
+          </p>
         </div>
       ) : listView === "table" ? (
         <div className="bg-card border border-border rounded-lg overflow-hidden">
@@ -278,13 +314,16 @@ export default function DatasetsPage({ user, onNavigateToBenchmark, onNavigateTo
             <table className="w-full text-xs">
               <thead>
                 <tr className="border-b border-border">
-                  {["Name", "Source", "Points", "Created", "Last run", ""].map(col => (
+                  {(user?.role === "admin"
+                    ? ["Name", "Source", "Points", "Added by", "Created", "Last run", ""]
+                    : ["Name", "Source", "Points", "Created", "Last run", ""]
+                  ).map(col => (
                     <th key={col} className="px-4 py-2.5 text-left font-mono text-[10px] text-muted-foreground uppercase tracking-wider whitespace-nowrap">{col}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {paginated.map(ds => (
+                {datasets.map(ds => (
                   <tr key={ds.id} className="border-b border-border/50 hover:bg-secondary/50 transition-colors">
                     <td className="px-4 py-3">
                       <Link
@@ -302,6 +341,11 @@ export default function DatasetsPage({ user, onNavigateToBenchmark, onNavigateTo
                       </span>
                     </td>
                     <td className="px-4 py-3 font-mono text-muted-foreground">{ds.point_count != null ? ds.point_count.toLocaleString() : "—"}</td>
+                    {user?.role === "admin" && (
+                      <td className="px-4 py-3 font-mono text-[10px] text-muted-foreground max-w-[140px] truncate" title={ds.created_by}>
+                        {ds.created_by || "—"}
+                      </td>
+                    )}
                     <td className="px-4 py-3 font-mono text-muted-foreground">{ds.created_date ? new Date(ds.created_date).toLocaleString() : "—"}</td>
                     <td className="px-4 py-3 font-mono text-muted-foreground">
                       {lastBenchmarkByDataset[ds.id] ? new Date(lastBenchmarkByDataset[ds.id]).toLocaleString() : "—"}
@@ -309,6 +353,7 @@ export default function DatasetsPage({ user, onNavigateToBenchmark, onNavigateTo
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-1">
                         <button
+                          type="button"
                           onClick={() => onNavigateToBenchmark?.(ds)}
                           className="flex items-center gap-1 py-1 px-2 rounded text-[10px] font-medium bg-primary/10 text-cyan border border-primary/20 hover:bg-primary/20"
                         >
@@ -316,6 +361,7 @@ export default function DatasetsPage({ user, onNavigateToBenchmark, onNavigateTo
                         </button>
                         {(user?.role === "admin" || ds.created_by === user?.email) && (
                           <button
+                            type="button"
                             onClick={() => setDeleteTarget(ds)}
                             className="p-1 rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
                             title="Delete"
@@ -332,16 +378,16 @@ export default function DatasetsPage({ user, onNavigateToBenchmark, onNavigateTo
           </div>
           {totalPages > 1 && (
             <div className="flex justify-center gap-2 py-2 border-t border-border">
-              <button onClick={() => setPage(p => Math.max(1, p - 1))} disabled={page <= 1} className="px-3 py-1 rounded-md text-xs bg-secondary border border-border hover:border-primary/40 disabled:opacity-50 disabled:pointer-events-none">Previous</button>
+              <button type="button" onClick={() => setPage(p => Math.max(1, p - 1))} disabled={page <= 1} className="px-3 py-1 rounded-md text-xs bg-secondary border border-border hover:border-primary/40 disabled:opacity-50 disabled:pointer-events-none">Previous</button>
               <span className="text-xs text-muted-foreground font-mono">{page} / {totalPages}</span>
-              <button onClick={() => setPage(p => Math.min(totalPages, p + 1))} disabled={page >= totalPages} className="px-3 py-1 rounded-md text-xs bg-secondary border border-border hover:border-primary/40 disabled:opacity-50 disabled:pointer-events-none">Next</button>
+              <button type="button" onClick={() => setPage(p => Math.min(totalPages, p + 1))} disabled={page >= totalPages} className="px-3 py-1 rounded-md text-xs bg-secondary border border-border hover:border-primary/40 disabled:opacity-50 disabled:pointer-events-none">Next</button>
             </div>
           )}
         </div>
       ) : (
         <>
         <div className="grid grid-cols-3 gap-3">
-          {paginated.map(ds => (
+          {datasets.map(ds => (
             <div key={ds.id} className="bg-card border border-border rounded-lg p-4 space-y-3 hover:border-primary/30 transition-colors">
               <Link
                 to={`/dataset/${ds.id}`}
@@ -358,6 +404,9 @@ export default function DatasetsPage({ user, onNavigateToBenchmark, onNavigateTo
                     </div>
                   </div>
                 </div>
+                {user?.role === "admin" && ds.created_by && (
+                  <p className="text-[10px] font-mono text-muted-foreground mt-1 truncate" title={ds.created_by}>by {ds.created_by}</p>
+                )}
                 {ds.description && <p className="text-xs text-muted-foreground mt-1 line-clamp-2">{ds.description}</p>}
                 <div className="flex flex-wrap gap-x-3 gap-y-0.5 mt-2 text-[10px] font-mono text-muted-foreground">
                   <span>Created: {ds.created_date ? new Date(ds.created_date).toLocaleString() : "—"}</span>
@@ -368,6 +417,7 @@ export default function DatasetsPage({ user, onNavigateToBenchmark, onNavigateTo
               </Link>
               <div className="flex gap-2 pt-1 border-t border-border/50">
                 <button
+                  type="button"
                   onClick={(e) => { e.stopPropagation(); onNavigateToBenchmark?.(ds); }}
                   className="flex-1 flex items-center justify-center gap-1 py-1.5 rounded-md text-xs font-medium bg-primary/10 text-cyan border border-primary/20 hover:bg-primary/20 transition-colors"
                 >
@@ -375,6 +425,7 @@ export default function DatasetsPage({ user, onNavigateToBenchmark, onNavigateTo
                 </button>
                 {(user?.role === "admin" || ds.created_by === user?.email) && (
                   <button
+                    type="button"
                     onClick={(e) => { e.stopPropagation(); setDeleteTarget(ds); }}
                     className="flex items-center justify-center gap-1 py-1.5 px-3 rounded-md text-xs font-medium bg-destructive text-destructive-foreground border border-destructive hover:bg-destructive/90 transition-colors"
                   >
@@ -388,6 +439,7 @@ export default function DatasetsPage({ user, onNavigateToBenchmark, onNavigateTo
         {totalPages > 1 && (
           <div className="flex items-center justify-center gap-2 pt-2">
             <button
+              type="button"
               onClick={() => setPage(p => Math.max(1, p - 1))}
               disabled={page <= 1}
               className="px-3 py-1 rounded-md text-xs bg-secondary border border-border hover:border-primary/40 disabled:opacity-50 disabled:pointer-events-none"
@@ -398,6 +450,7 @@ export default function DatasetsPage({ user, onNavigateToBenchmark, onNavigateTo
               {page} / {totalPages}
             </span>
             <button
+              type="button"
               onClick={() => setPage(p => Math.min(totalPages, p + 1))}
               disabled={page >= totalPages}
               className="px-3 py-1 rounded-md text-xs bg-secondary border border-border hover:border-primary/40 disabled:opacity-50 disabled:pointer-events-none"

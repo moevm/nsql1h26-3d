@@ -1,8 +1,9 @@
 import React from "react";
 import { LogOut } from "lucide-react";
-import { pointCloud } from "@/api/pointCloudClient";
+import { useAuth } from "@/lib/AuthContext";
 
 export default function TopBar({ title, user, datasetName, onDatasetsClick }) {
+  const { logout } = useAuth();
   const initials = user?.full_name
     ? user.full_name.split(" ").map(n => n[0]).join("").toUpperCase().slice(0, 2)
     : user?.email?.[0]?.toUpperCase() || "?";
@@ -34,7 +35,8 @@ export default function TopBar({ title, user, datasetName, onDatasetsClick }) {
           <span className="text-[10px] font-bold text-cyan">{initials}</span>
         </div>
         <button
-          onClick={() => pointCloud.auth.logout()}
+          type="button"
+          onClick={() => logout()}
           className="w-7 h-7 rounded-md bg-secondary border border-border flex items-center justify-center hover:border-destructive/40 hover:text-destructive transition-colors"
           title="Logout"
         >

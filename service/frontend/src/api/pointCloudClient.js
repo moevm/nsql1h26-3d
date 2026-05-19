@@ -1,5 +1,5 @@
-const API_BASE = import.meta.env.VITE_API_BASE ?? "";
-const TOKEN_KEY = "pointcloud_token";
+const API_BASE = import.meta.env.VITE_API_BASE ?? "/api";
+export const TOKEN_KEY = "pointcloud_token";
 
 function getToken() {
   return localStorage.getItem(TOKEN_KEY);
@@ -31,16 +31,39 @@ async function api(path, { method = "GET", body, isForm = false } = {}) {
   return response.json();
 }
 
+async function apiBlob(path, { method = "GET", body, isForm = false } = {}) {
+  const token = getToken();
+  const headers = {};
+  if (!isForm) headers["Content-Type"] = "application/json";
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  const response = await fetch(`${API_BASE}${path}`, {
+    method,
+    headers,
+    body: body == null ? undefined : isForm ? body : JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    const error = new Error(text || "API error");
+    error.status = response.status;
+    throw error;
+  }
+  return response.blob();
+}
+
 function entityApi(name) {
   return {
     list: (orderBy, limit) =>
       api(`/entities/${name}/list?orderBy=${encodeURIComponent(orderBy || "-created_date")}&limit=${limit ?? 100}`),
-    filter: (filter, orderBy, limit) =>
-      api(
-        `/entities/${name}/filter?filter=${encodeURIComponent(JSON.stringify(filter ?? {}))}&orderBy=${encodeURIComponent(
-          orderBy || "-created_date"
-        )}&limit=${limit ?? 100}`
-      ),
+    filter: (filter, orderBy, limit, skip, options) => {
+      const params = new URLSearchParams();
+      params.set("filter", JSON.stringify(filter ?? {}));
+      params.set("orderBy", orderBy || "-created_date");
+      params.set("limit", String(limit ?? 100));
+      if (skip != null && skip > 0) params.set("skip", String(skip));
+      if (options?.countTotal) params.set("countTotal", "true");
+      return api(`/entities/${name}/filter?${params.toString()}`);
+    },
     get: (id) => api(`/entities/${name}/${id}`),
     create: (data) => api(`/entities/${name}`, { method: "POST", body: { data } }),
     update: (id, data) => api(`/entities/${name}/${id}`, { method: "PATCH", body: { data } }),
@@ -97,6 +120,21 @@ export const pointCloud = {
         method: "POST",
         body: { dataset_id, algorithm },
       }),
+  },
+  spatial: {
+    rangeQuery: ({ dataset_id, algorithm, bounds }) =>
+      api("/spatial/range-query", {
+        method: "POST",
+        body: { dataset_id, algorithm, bounds },
+      }),
+  },
+  backup: {
+    export: () => api("/backup/export", { method: "POST" }),
+    importReplace: (payload) => api("/backup/import-replace", { method: "POST", body: payload }),
+  },
+  datasets: {
+    query: (body) => api("/datasets/query", { method: "POST", body }),
+    exportCsv: (id) => apiBlob(`/datasets/${encodeURIComponent(id)}/export`),
   },
   entities: {
     Dataset: entityApi("Dataset"),
