@@ -1,3 +1,4 @@
+import csv
 import hashlib
 import json
 import logging
@@ -8,13 +9,17 @@ import secrets
 import time
 import tracemalloc
 from datetime import datetime, timezone
+from io import StringIO
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import unquote, urlparse
 
+import csv
+from io import StringIO
+
 import numpy as np
 from bson import ObjectId
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Security, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Response, Security, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
@@ -1900,22 +1905,53 @@ async def users_invite(payload: InviteRequest, admin: dict[str, Any] = Depends(r
     return oid_str(await db.users.find_one({"_id": inserted.inserted_id}))
 
 
-@app.post("/files/upload")
-async def files_upload(file: UploadFile = File(...), user: dict[str, Any] = Depends(require_user)) -> dict[str, str]:
-    ext = Path(file.filename).suffix
-    safe_name = f"{secrets.token_hex(8)}{ext}"
-    target = UPLOAD_DIR / safe_name
-    content = await file.read()
-    target.write_bytes(content)
-    return {"file_url": f"/files/{safe_name}"}
+def _build_backup_csv_response(
+    datasets: list[dict[str, Any]],
+    benchmarks: list[dict[str, Any]],
+    users: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+) -> Response:
+    output = StringIO()
+    writer = csv.writer(output)
 
+    def write_section(name: str, rows: list[dict[str, Any]]) -> None:
+        writer.writerow([f"section:{name}"])
+        if not rows:
+            writer.writerow(["# empty"])
+            writer.writerow([])
+            return
+        headers = list(rows[0].keys())
+        writer.writerow(headers)
+        for row in rows:
+            writer.writerow([row.get(key, "") for key in headers])
+        writer.writerow([])
+
+    write_section("datasets", datasets)
+    write_section("benchmarks", benchmarks)
+    write_section("users", users)
+    write_section("benchmark_status_events", events)
+
+    content = output.getvalue()
+    filename = f"pointcloud_backup_{now_iso().replace(':', '-')}.csv"
+    return Response(
+        content,
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+ERROR
 
 @app.post("/backup/export")
-async def backup_export(admin: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+async def backup_export(format: Optional[str] = Query(default="json"), admin: dict[str, Any] = Depends(require_admin)) -> Any:
     datasets = [oid_str(x) for x in await db.datasets.find({}).to_list(length=100000)]
     benchmarks = [oid_str(x) for x in await db.benchmark_results.find({}).to_list(length=100000)]
     users = [oid_str(x) for x in await db.users.find({"role": {"$ne": "admin"}}, {"password_hash": 0}).to_list(length=100000)]
     events = [oid_str(x) for x in await db.benchmark_status_events.find({}).to_list(length=100000)]
+
+    if format.lower() == "csv":
+        return _build_backup_csv_response(datasets, benchmarks, users, events)
+
     return {
         "exported_at": now_iso(),
         "version": "1.0",

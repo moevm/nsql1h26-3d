@@ -21,6 +21,7 @@ export default function DatasetCreateMenu({ onSelect, onCreated }) {
   const [uploading, setUploading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [uploadedFile, setUploadedFile] = useState(null);
+  const [uploadError, setUploadError] = useState("");
   const fileRef = useRef(null);
 
   const handleGenerate = async () => {
@@ -43,9 +44,19 @@ export default function DatasetCreateMenu({ onSelect, onCreated }) {
     const file = e.target.files?.[0];
     if (!file) return;
     setUploading(true);
-    const { file_url } = await pointCloud.integrations.Core.UploadFile({ file });
-    setUploadedFile({ file_url, name: file.name });
-    setUploading(false);
+    setUploadError("");
+    try {
+      const { file_url, point_count } = await pointCloud.integrations.Core.UploadFile({ file });
+      setUploadedFile({ file_url, name: file.name });
+      if (typeof point_count === "number" && point_count > 0) {
+        setPtCount(point_count);
+      }
+    } catch (err) {
+      setUploadError(err?.message || "File upload failed");
+      setUploadedFile(null);
+    } finally {
+      setUploading(false);
+    }
   };
 
   const handleSaveUploaded = async () => {
@@ -174,6 +185,9 @@ export default function DatasetCreateMenu({ onSelect, onCreated }) {
 
             {uploadedFile && (
               <>
+                {uploadError ? (
+                  <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 mb-3">{uploadError}</div>
+                ) : null}
                 <div className="space-y-1.5">
                   <label className="text-[10px] text-muted-foreground font-mono uppercase tracking-wider">Approx. Point Count</label>
                   <div className="flex gap-1.5 flex-wrap">
@@ -190,7 +204,7 @@ export default function DatasetCreateMenu({ onSelect, onCreated }) {
                   placeholder="Dataset name (optional)"
                   className="w-full bg-secondary border border-border rounded-md px-3 py-2 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-primary/50"
                 />
-                <button onClick={handleSaveUploaded} disabled={saving}
+                <button onClick={handleSaveUploaded} disabled={saving || !!uploadError}
                   className="w-full flex items-center justify-center gap-2 py-2 rounded-md text-xs font-semibold bg-cyan text-background hover:brightness-110 disabled:opacity-50 glow-cyan"
                 >
                   {saving ? <><Loader2 className="w-3 h-3 animate-spin" /> Saving…</> : "Save & Load Dataset"}
