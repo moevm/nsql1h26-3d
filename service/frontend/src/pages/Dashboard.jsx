@@ -13,7 +13,7 @@ import AdminPage from "./AdminPage";
 import BackupPage from "./BackupPage";
 import { useSettings } from "@/lib/SettingsContext";
 import { toast } from "@/components/ui/use-toast";
-import { Loader2, Play } from "lucide-react";
+import { Loader2, Play, Download } from "lucide-react";
 
 const PAGE_TITLES = {
   datasets: "Datasets",
@@ -82,6 +82,7 @@ export default function Dashboard() {
   const [savingName, setSavingName] = useState(false);
   const [editingComment, setEditingComment] = useState("");
   const [savingComment, setSavingComment] = useState(false);
+  const [exportingCsv, setExportingCsv] = useState(false);
 
   // Spatial range query state
   const [rangeBounds, setRangeBounds] = useState({ xMin: -0.5, xMax: 0.5, yMin: -0.5, yMax: 0.5, zMin: -0.5, zMax: 0.5 });
@@ -106,6 +107,30 @@ export default function Dashboard() {
       : userId
         ? "admin"
         : (VALID_SECTIONS.includes(segment) ? segment : "datasets");
+
+  const handleExportDatasetCsv = async () => {
+    if (!selectedDataset) return;
+    setExportingCsv(true);
+    try {
+      const blob = await pointCloud.datasets.exportCsv(selectedDataset.id);
+      const safeName = (selectedDataset.name || selectedDataset.id || "dataset").replace(/[^A-Za-z0-9._-]+/g, "_") + ".csv";
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = safeName;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      toast({
+        title: "Export failed",
+        description: err?.message || "Could not download dataset CSV.",
+      });
+    } finally {
+      setExportingCsv(false);
+    }
+  };
 
   useEffect(() => {
     if (!datasetId) {
@@ -430,6 +455,16 @@ export default function Dashboard() {
                         className="w-full bg-secondary border border-border rounded px-2 py-1 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-primary/50 resize-y min-h-[48px]"
                       />
                       {savingComment && <span className="text-[10px] text-muted-foreground">Saving…</span>}
+                    </div>
+                    <div className="pt-3 border-t border-border/50">
+                      <button
+                        type="button"
+                        onClick={handleExportDatasetCsv}
+                        disabled={exportingCsv}
+                        className="w-full flex items-center justify-center gap-2 py-2 rounded-md text-xs font-semibold bg-secondary text-foreground border border-border hover:border-primary/40 hover:text-foreground disabled:opacity-50"
+                      >
+                        {exportingCsv ? <><Loader2 className="w-3 h-3 animate-spin" /> Exporting…</> : <><Download className="w-3 h-3" /> Export as CSV</>}
+                      </button>
                     </div>
                   </div>
 

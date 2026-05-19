@@ -43,6 +43,11 @@ export default function DatasetCreateMenu({ onSelect, onCreated }) {
   const handleFileUpload = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".csv")) {
+      setUploadError("Only .csv files are supported");
+      setUploadedFile(null);
+      return;
+    }
     setUploading(true);
     setUploadError("");
     try {
@@ -179,8 +184,8 @@ export default function DatasetCreateMenu({ onSelect, onCreated }) {
               <p className="text-xs text-foreground font-medium">
                 {uploadedFile ? uploadedFile.name : "Click to upload"}
               </p>
-              <p className="text-[10px] text-muted-foreground mt-1">.xyz, .ply, .pcd, .csv, .las</p>
-              <input ref={fileRef} type="file" accept=".xyz,.ply,.pcd,.csv,.las,.txt" className="hidden" onChange={handleFileUpload} />
+              <p className="text-[10px] text-muted-foreground mt-1">Only .csv files are supported</p>
+              <input ref={fileRef} type="file" accept=".csv" className="hidden" onChange={handleFileUpload} />
             </div>
 
             {uploadedFile && (
